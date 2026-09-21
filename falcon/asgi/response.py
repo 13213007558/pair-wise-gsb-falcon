@@ -76,8 +76,14 @@ class Response(response.Response):
 
     If the object assigned to :attr:`~.stream` holds any resources
     (such as a file handle) that must be explicitly released, the
-    object must implement a ``close()`` method. The ``close()`` method
-    will be called after exhausting the iterable or file-like object.
+    object may implement an ``aclose()`` or ``close()`` method
+    (the former taking precedence if both are present). The method
+    will be awaited exactly once, after exhausting the iterable or
+    file-like object, as well as when streaming fails or the request
+    task is cancelled (e.g., when the client disconnects). Since
+    async generators support ``aclose()``, this also ensures that
+    any ``finally`` blocks inside them are executed in a timely
+    manner.
 
     Note:
         In order to be compatible with Python 3.7+ and PEP 479,
@@ -165,8 +171,9 @@ class Response(response.Response):
 
         Args:
             stream: A readable, awaitable file-like object or async iterable
-                that returns byte strings. If the object implements a close()
-                method, it will be called after reading all of the data.
+                that returns byte strings. If the object implements an
+                aclose() or close() method, it will be awaited after reading
+                all of the data (see also :attr:`~falcon.asgi.Response.stream`).
             content_length (int): Length of the stream, used for the
                 Content-Length header in the response.
         """
