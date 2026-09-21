@@ -717,6 +717,13 @@ class App(Generic[_ReqT, _RespT]):
                 since it will otherwise delay compilation until the first request
                 is routed. See :meth:`.CompiledRouter.add_route` for further details.
 
+            name (str): Optional name to associate with this route, so that
+                its URL can later be built via :meth:`~.App.url_for`. This
+                keyword argument is only supported by routers that implement
+                named routes, such as the default :class:`.CompiledRouter`.
+
+                .. versionadded:: 4.4
+
         Note:
             Any additional keyword arguments not defined above are passed
             through to the underlying router's ``add_route()`` method. The
@@ -739,6 +746,53 @@ class App(Generic[_ReqT, _RespT]):
             raise ValueError("uri_template may not contain '//'")
 
         self._router.add_route(uri_template, resource, **kwargs)
+
+    def url_for(self, name: str, /, **params: Any) -> str:
+        """Build the URI path for a named route.
+
+        The route must have been registered with a name, via the ``name``
+        keyword argument of :meth:`~.App.add_route`. The path is built
+        from the route's URI template by interpolating the given field
+        values, percent-encoding them as needed (see
+        :meth:`falcon.routing.CompiledRouter.url_for` for the details).
+
+        Note:
+            This method delegates to the configured router's ``url_for()``
+            method. The default :class:`~falcon.routing.CompiledRouter`
+            supports named routes; a custom router that does not implement
+            ``url_for()`` causes :class:`NotImplementedError` to be raised.
+
+        Args:
+            name (str): The name of the route. This is a positional-only
+                argument, so that a route field may itself be named
+                ``name``.
+
+        Keyword Args:
+            **params: A value for each templatized field of the route.
+
+        Returns:
+            str: The URI path for the route, relative to the root of the
+            application. When the application is mounted under a prefix
+            (e.g., via ``SCRIPT_NAME``), that prefix is not included.
+
+        Raises:
+            NotImplementedError: The configured router does not support
+                named routes, or one of the route's field converters does
+                not support reversing.
+            ValueError: No route is registered under `name`, or the given
+                parameters do not match the route's URI template.
+
+        .. versionadded:: 4.4
+        """
+        router_url_for = getattr(self._router, 'url_for', None)
+        if router_url_for is None:
+            raise NotImplementedError(
+                'The configured router does not support named routes; '
+                'url_for() requires a router that implements url_for(), '
+                'such as falcon.routing.CompiledRouter.'
+            )
+
+        return cast(str, router_url_for(name, **params))
 
     def add_static_route(
         self,

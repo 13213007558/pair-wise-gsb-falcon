@@ -62,6 +62,43 @@ class BaseConverter(metaclass=abc.ABCMeta):
             can not be converted.
         """
 
+    def reverse(self, value: Any) -> str:
+        """Convert a Python value back to a URI template field string.
+
+        This method is used by the default router when building a URL for
+        a named route (see :meth:``~falcon.routing.CompiledRouter.url_for``).
+        The returned string should be the *unencoded* text of the field;
+        the router takes care of percent-encoding the value. For a
+        converter that sets ``CONSUME_MULTIPLE_SEGMENTS`` to ``True``,
+        any ``'/'`` character in the returned string is treated as a path
+        segment separator, and each segment is encoded individually.
+
+        The default implementation raises :class:``NotImplementedError``;
+        converter classes that do not support reversing may simply rely
+        on the inherited implementation.
+
+        Args:
+            value (object): The Python value to convert back to a string.
+                This is normally a value of the same type as produced by
+                :meth:``~.BaseConverter.convert``.
+
+        Returns:
+            str: The unencoded string representation of ``value``, suitable
+            for inclusion in a URI path.
+
+        Raises:
+            NotImplementedError: The converter does not support reversing.
+            ValueError: The value can not be converted back to a valid
+                field string (e.g., it violates the converter's
+                constraints).
+
+        .. versionadded:: 4.4
+        """
+        raise NotImplementedError(
+            '{0} does not support reversing; it can not be used to '
+            'build a URL for a named route.'.format(type(self).__name__)
+        )
+
 
 def _consumes_multiple_segments(converter: object) -> bool:
     return getattr(converter, 'CONSUME_MULTIPLE_SEGMENTS', False)
@@ -111,6 +148,50 @@ class IntConverter(BaseConverter):
             return None
 
         return _validate_min_max_value(self, converted)
+
+    def reverse(self, value: int) -> str:
+        """Convert an int back to its URI template field string.
+
+        Args:
+            value (int): The value to convert. It must satisfy the
+                ``num_digits``, ``min``, and ``max`` constraints that the
+                converter was configured with. Values with fewer digits
+                than ``num_digits`` are padded with leading zeros.
+
+        Returns:
+            str: The string representation of ``value``.
+
+        Raises:
+            ValueError: ``value`` is not an integer, or it violates the
+                converter's constraints.
+
+        .. versionadded:: 4.4
+        """
+        try:
+            int_value = int(value)
+        except (TypeError, ValueError) as ex:
+            raise ValueError(
+                'value must be an integer, got: {0!r}'.format(value)
+            ) from ex
+
+        if _validate_min_max_value(self, int_value) is None:
+            raise ValueError(
+                'value is out of the configured range: {0!r}'.format(value)
+            )
+
+        text = str(int_value)
+
+        if self._num_digits is not None:
+            if len(text) > self._num_digits:
+                raise ValueError(
+                    'value must have at most {0} digits, got: {1!r}'.format(
+                        self._num_digits, value
+                    )
+                )
+
+            text = text.zfill(self._num_digits)
+
+        return text
 
 
 @overload
@@ -176,6 +257,38 @@ class FloatConverter(BaseConverter):
 
         return _validate_min_max_value(self, converted)
 
+    def reverse(self, value: float) -> str:
+        """Convert a float back to its URI template field string.
+
+        Args:
+            value (float): The value to convert. It must satisfy the
+                ``min``, ``max``, and ``finite`` constraints that the
+                converter was configured with.
+
+        Returns:
+            str: The string representation of ``value``.
+
+        Raises:
+            ValueError: ``value`` is not a finite float, or it violates
+                the converter's constraints.
+
+        .. versionadded:: 4.4
+        """
+        try:
+            float_value = float(value)
+        except (TypeError, ValueError) as ex:
+            raise ValueError('value must be a float, got: {0!r}'.format(value)) from ex
+
+        if self._finite and not isfinite(float_value):
+            raise ValueError('value must be finite, got: {0!r}'.format(value))
+
+        if _validate_min_max_value(self, float_value) is None:
+            raise ValueError(
+                'value is out of the configured range: {0!r}'.format(value)
+            )
+
+        return str(float_value)
+
 
 class DateTimeConverter(BaseConverter):
     """Converts a field value to a datetime.
@@ -206,6 +319,27 @@ class DateTimeConverter(BaseConverter):
         except ValueError:
             return None
 
+    def reverse(self, value: datetime) -> str:
+        """Convert a datetime back to its URI template field string.
+
+        Args:
+            value (datetime): The value to convert, formatted according
+                to the ``format_string`` that the converter was
+                configured with.
+
+        Returns:
+            str: The formatted datetime string.
+
+        Raises:
+            TypeError: ``value`` is not a :class:``~datetime.datetime``.
+
+        .. versionadded:: 4.4
+        """
+        if not isinstance(value, datetime):
+            raise TypeError('value must be a datetime, got: {0!r}'.format(value))
+
+        return value.strftime(self._format_string)
+
 
 class UUIDConverter(BaseConverter):
     """Converts a field value to a uuid.UUID.
@@ -222,6 +356,32 @@ class UUIDConverter(BaseConverter):
             return uuid.UUID(value)
         except ValueError:
             return None
+
+    def reverse(self, value: uuid.UUID | str) -> str:
+        """Convert a UUID back to its URI template field string.
+
+        Args:
+            value (uuid.UUID or str): The value to convert. A string is
+                first parsed and then rendered in the canonical
+                hyphenated form.
+
+        Returns:
+            str: The canonical string representation of the UUID.
+
+        Raises:
+            ValueError: ``value`` is not a valid UUID.
+
+        .. versionadded:: 4.4
+        """
+        if not isinstance(value, uuid.UUID):
+            try:
+                value = uuid.UUID(str(value))
+            except ValueError as ex:
+                raise ValueError(
+                    'value must be a valid UUID, got: {0!r}'.format(value)
+                ) from ex
+
+        return str(value)
 
 
 class PathConverter(BaseConverter):
@@ -244,12 +404,36 @@ class PathConverter(BaseConverter):
 
     (See also: :ref:`trailing_slash_in_path`)
 
+    When reversing (see :meth:`falcon.routing.CompiledRouter.url_for`),
+    the value may be given either as a single string or as an iterable of
+    path segments. In both cases, ``'/'`` denotes a segment separator;
+    each segment is percent-encoded individually, so a literal ``'/'``
+    can not be embedded within a single segment.
+
     .. versionadded:: 4.0
     """
 
     CONSUME_MULTIPLE_SEGMENTS = True
 
     def convert(self, value: Iterable[str]) -> str:
+        return '/'.join(value)
+
+    def reverse(self, value: str | Iterable[str]) -> str:
+        """Convert a path back to its URI template field string.
+
+        Args:
+            value (str or Iterable[str]): The remaining path, either as
+                a single string with ``'/'``-separated segments, or as
+                an iterable of individual segments.
+
+        Returns:
+            str: The ``'/'``-separated path string.
+
+        .. versionadded:: 4.4
+        """
+        if isinstance(value, str):
+            return value
+
         return '/'.join(value)
 
 

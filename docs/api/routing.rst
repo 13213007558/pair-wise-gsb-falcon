@@ -237,6 +237,47 @@ segment. For example::
 and a walkthrough of setting up routes within the context of a sample
 application.)
 
+.. _routing_named_routes:
+
+Named Routes
+------------
+
+.. versionadded:: 4.4
+
+A route may be given a name, so that its URL can later be built from the
+route's URI template, without hard-coding the path in the application::
+
+    app.add_route('/things/{tid:int}', things, name='thing')
+
+    # ...
+
+    url = app.url_for('thing', tid=42)
+    assert url == '/things/42'
+
+:meth:`falcon.App.url_for` (supported by both WSGI and ASGI apps)
+interpolates the given field values into the route's URI template. Each
+value is passed through the corresponding field converter, if any, which
+also validates it against the converter's constraints (see also
+:meth:`falcon.routing.BaseConverter.reverse`). All values are
+percent-encoded as needed. For a converter that consumes multiple path
+segments, such as the ``path`` converter, ``'/'`` denotes a segment
+separator, and each segment is encoded individually.
+
+The generated path is relative to the root of the application; when the
+application itself is mounted under a prefix (e.g., via
+``SCRIPT_NAME``), that prefix is not included.
+
+Route names must be unique across the router. Registering a name that is
+already bound to a different URI template raises ``ValueError``, as does
+building a URL with missing or unexpected field values. When a route is
+overridden by re-adding its URI template, any names previously bound to
+that template are discarded unless they are registered again.
+
+Note:
+    Custom routers are not required to implement named routes; when the
+    configured router does not provide ``url_for()``,
+    :meth:`falcon.App.url_for` raises :class:`NotImplementedError`.
+
 .. _routing_field_converters:
 
 Field Converters
@@ -329,6 +370,10 @@ simply a class that implements the ``BaseConverter`` interface:
 
 .. autoclass:: falcon.routing.BaseConverter
     :members:
+
+A custom converter may also implement
+:meth:`~falcon.routing.BaseConverter.reverse` in order to support
+building URLs for :ref:`named routes <routing_named_routes>`.
 
 .. _routing_custom:
 
