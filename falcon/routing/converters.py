@@ -62,6 +62,42 @@ class BaseConverter(metaclass=abc.ABCMeta):
             can not be converted.
         """
 
+    def reverse(self, value: Any) -> str | Iterable[str]:
+        """Convert a Python value back to a URI template field string.
+
+        This method is used by :meth:`~.CompiledRouter.url_for` in order to
+        render a field value when generating the path for a named route.
+        The returned string should be a raw (unencoded) value; the router
+        takes care of percent-encoding any reserved characters.
+
+        Note:
+            The base implementation raises :exc:`NotImplementedError`.
+            Custom converters that are meant to be used with named routes
+            must override this method.
+
+        Args:
+            value (object): The Python value to convert back to a string.
+                If ``CONSUME_MULTIPLE_SEGMENTS=True``, the value may also
+                be an iterable of strings, one per path segment.
+
+        Returns:
+            str | Iterable[str]: The string representation of the value,
+            suitable for inclusion in a URI path. If
+            ``CONSUME_MULTIPLE_SEGMENTS=True``, an iterable of path
+            segment strings may be returned instead, in order to
+            unambiguously convey the segment boundaries.
+
+        Raises:
+            NotImplementedError: The converter does not support reversing
+                values back to strings.
+            ValueError: The value can not be represented by this converter.
+        """
+        raise NotImplementedError(
+            '{0} does not support reversing URI template field values'.format(
+                type(self).__name__
+            )
+        )
+
 
 def _consumes_multiple_segments(converter: object) -> bool:
     return getattr(converter, 'CONSUME_MULTIPLE_SEGMENTS', False)
@@ -111,6 +147,20 @@ class IntConverter(BaseConverter):
             return None
 
         return _validate_min_max_value(self, converted)
+
+    def reverse(self, value: int) -> str:
+        text = str(value)
+
+        # NOTE: Reuse convert() so that num_digits, min, and max are
+        #   validated consistently with the forward direction.
+        if self.convert(text) is None:
+            raise ValueError(
+                'value {0!r} can not be reversed by {1}'.format(
+                    text, type(self).__name__
+                )
+            )
+
+        return text
 
 
 @overload
@@ -176,6 +226,20 @@ class FloatConverter(BaseConverter):
 
         return _validate_min_max_value(self, converted)
 
+    def reverse(self, value: float) -> str:
+        text = str(value)
+
+        # NOTE: Reuse convert() so that finite, min, and max are
+        #   validated consistently with the forward direction.
+        if self.convert(text) is None:
+            raise ValueError(
+                'value {0!r} can not be reversed by {1}'.format(
+                    text, type(self).__name__
+                )
+            )
+
+        return text
+
 
 class DateTimeConverter(BaseConverter):
     """Converts a field value to a datetime.
@@ -206,6 +270,9 @@ class DateTimeConverter(BaseConverter):
         except ValueError:
             return None
 
+    def reverse(self, value: datetime) -> str:
+        return value.strftime(self._format_string)
+
 
 class UUIDConverter(BaseConverter):
     """Converts a field value to a uuid.UUID.
@@ -222,6 +289,11 @@ class UUIDConverter(BaseConverter):
             return uuid.UUID(value)
         except ValueError:
             return None
+
+    def reverse(self, value: uuid.UUID | str) -> str:
+        # NOTE: Parsing the value first both validates it and normalizes
+        #   the rendered string (e.g., adds any missing hyphens).
+        return str(uuid.UUID(str(value)))
 
 
 class PathConverter(BaseConverter):
@@ -251,6 +323,17 @@ class PathConverter(BaseConverter):
 
     def convert(self, value: Iterable[str]) -> str:
         return '/'.join(value)
+
+    def reverse(self, value: Iterable[str] | str) -> str | list[str]:
+        # NOTE: A plain string is treated as a path remainder in which
+        #   '/' separates segments. Passing an iterable of segments
+        #   instead preserves the segment boundaries, so that a '/'
+        #   within a single segment is percent-encoded by the router
+        #   rather than being interpreted as a segment separator.
+        if isinstance(value, str):
+            return value
+
+        return [str(segment) for segment in value]
 
 
 class RegexConverter(BaseConverter):

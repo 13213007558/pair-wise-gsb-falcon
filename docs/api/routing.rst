@@ -330,6 +330,75 @@ simply a class that implements the ``BaseConverter`` interface:
 .. autoclass:: falcon.routing.BaseConverter
     :members:
 
+.. _routing_reverse:
+
+Reverse Routing
+---------------
+
+Routes registered with the default :class:`.CompiledRouter` can be assigned
+a unique name via the `name` keyword argument of
+:meth:`falcon.App.add_route` (or :meth:`falcon.asgi.App.add_route`).
+The name can then be used to generate the route's URI path from a set of
+template field values, without hard-coding the URI template in the
+application code:
+
+.. code:: python
+
+    app.add_route('/teams/{tid:int(8)}', teams, name='team')
+
+    # Later, e.g., inside a responder:
+    path = app.url_for('team', tid=12345678)
+    assert path == '/teams/12345678'
+
+This is particularly useful for generating stable hypermedia links between
+resources. The generated path is guaranteed to route back to the same
+resource, since it is rendered from the same URI template and field
+converters that are used for matching incoming requests:
+
+- Field values are converted back to strings by the same converters
+  declared in the template (see :meth:`.BaseConverter.reverse`), so
+  converter constraints such as `int(8)` or `min`/`max` are also
+  enforced when generating a path.
+- The resulting field strings are percent-encoded as needed, so values
+  containing slashes, whitespace, non-ASCII characters, percent signs, or
+  other reserved characters can not corrupt the structure of the
+  generated path.
+- For a field using the `path` converter, the value may be given either
+  as a string (in which case `'/'` separates the path segments) or as
+  an iterable of individual path segments. In the latter case, a `'/'`
+  within a single segment is percent-encoded rather than being
+  interpreted as a segment separator.
+
+Note that the returned path is relative to the application root. If the
+application is mounted under a prefix (such as the WSGI `SCRIPT_NAME`),
+the prefix must be prepended by the caller.
+
+Route names must be unique across the application. Registering a different
+URI template under an already-used name raises an error, and a failed
+registration never modifies the name index. When a route is overridden by
+re-adding its URI template, any name previously assigned to that template
+is invalidated, unless the same name is reassigned.
+
+Calling :meth:`.App.url_for` (or :meth:`.CompiledRouter.url_for`) with
+an unknown name raises :exc:`KeyError`; a missing or unexpected template
+field value raises :exc:`ValueError`. Converters that do not implement
+:meth:`.BaseConverter.reverse` (such as the built-in `re` converter)
+can not be used to generate paths, and raise :exc:`NotImplementedError`
+to that effect.
+
+Custom routers are not required to implement `url_for()`; in that case,
+:meth:`.App.url_for` raises :exc:`NotImplementedError`. Custom routers
+that do not support route names simply ignore the `name` keyword
+argument, as they already must for any unrecognized keyword arguments.
+
+.. note::
+
+    Custom field converters that are meant to be used with named routes
+    must implement :meth:`.BaseConverter.reverse` in addition to
+    :meth:`.BaseConverter.convert`.
+
+.. versionadded:: 4.4
+
 .. _routing_custom:
 
 Custom Routers

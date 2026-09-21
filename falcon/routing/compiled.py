@@ -37,11 +37,14 @@ from falcon.routing.util import set_default_responders
 from falcon.util.misc import is_python_func
 from falcon.util.sync import _should_wrap_non_coroutines
 from falcon.util.sync import wrap_sync_to_async
+from falcon.util.uri import encode_value
 
 if TYPE_CHECKING:
     from falcon import Request
 
     _CxElement = Union['_CxParent', '_CxChild']
+
+_TemplatePart = Union[str, '_TemplateField']
 
 _TAB_STR = ' ' * 4
 _FIELD_PATTERN = re.compile(
@@ -87,15 +90,17 @@ class CompiledRouter:
 
     __slots__ = (
         '_ast',
+        '_compile_lock',
         '_converter_map',
         '_converters',
         '_find',
         '_finder_src',
         '_options',
         '_patterns',
+        '_route_names',
         '_return_values',
         '_roots',
-        '_compile_lock',
+        '_template_names',
     )
 
     def __init__(self) -> None:
@@ -110,8 +115,10 @@ class CompiledRouter:
         self._converter_map = self._options.converters.data
 
         self._patterns: list[Pattern[Any]] = []
+        self._route_names: dict[str, _NamedRoute] = {}
         self._return_values: list[CompiledRouterNode] = []
         self._roots: list[CompiledRouterNode] = []
+        self._template_names: dict[str, str] = {}
 
         # NOTE(caselit): set _find to the delayed compile method to ensure that
         # compile is called when the router is first used
@@ -200,11 +207,26 @@ class CompiledRouter:
                     addition of new routes when hundreds of them are added at
                     once. It is advisable to only set this flag to ``True`` when
                     adding the final route.
+            name (str): Optional unique name for this route. The name can
+                later be passed to :meth:`.CompiledRouter.url_for` in order
+                to generate the route's URI path from a set of template
+                field values. Route names must be unique across the
+                application; registering a different route under an
+                already-used name raises an error. When a route is
+                overridden by re-adding its URI template, any name
+                previously assigned to that template is invalidated,
+                unless the same name is reassigned.
+
+                (See also: :ref:`routing_reverse`)
+
+                .. versionadded:: 4.4
         """
 
         # NOTE(kgriffs): falcon.asgi.App injects this private kwarg; it is
         #   only intended to be used internally.
         asgi: bool = kwargs.get('_asgi', False)
+
+        name: str | None = kwargs.pop('name', None)
 
         method_map = self.map_http_methods(resource, **kwargs)
 
@@ -313,7 +335,35 @@ class CompiledRouter:
                     )
                 insert(new_node.children, path_index + 1)
 
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise ValueError('Route names must be non-empty strings.')
+
+            existing = self._route_names.get(name)
+            if existing is not None and existing.uri_template != uri_template:
+                raise UnacceptableRouteError(
+                    'The route name "{0}" is already in use by another route '
+                    'with a different URI template ("{1}"). Route names must '
+                    'be unique.'.format(name, existing.uri_template)
+                )
+
         insert(self._roots)
+
+        # NOTE: The name index is only updated once the route has been
+        #   successfully inserted, so that a failed registration can not
+        #   pollute the index.
+        old_name = self._template_names.pop(uri_template, None)
+        if old_name is not None and old_name != name:
+            # NOTE: The route was overridden; its previous name is no
+            #   longer valid.
+            del self._route_names[old_name]
+
+        if name is not None:
+            self._route_names[name] = _NamedRoute(
+                uri_template, self._parse_uri_template(uri_template)
+            )
+            self._template_names[uri_template] = name
+
         # NOTE(caselit): when compile is True run the actual compile step, otherwise
         # reset the _find, so that _compile will be called on the next find use
         if kwargs.get('compile', False):
@@ -356,9 +406,138 @@ class CompiledRouter:
         else:
             return None
 
+    # NOTE: The route name is a positional-only argument so that a URI
+    #   template field may itself be named "name".
+    def url_for(self, name: str, /, **params: Any) -> str:
+        """Generate the URI path for the route registered with the given name.
+
+        The path is rendered from the route's URI template by substituting
+        the given field values. Values are converted back to strings using
+        the same field converters that were declared in the template (see
+        also :meth:`.BaseConverter.reverse`), and then percent-encoded as
+        needed, so that the resulting path is guaranteed to route back to
+        the same resource when matched against this router.
+
+        Note:
+            The returned path is relative to the application root; any
+            deployment-specific prefix (such as the WSGI ``SCRIPT_NAME``)
+            must be prepended by the caller.
+
+        Args:
+            name (str): The name that was assigned to the route via the
+                `name` keyword argument of
+                :meth:`.CompiledRouter.add_route`.
+
+        Keyword Args:
+            **params: Values for the URI template fields of the route.
+                Exactly one value per template field must be provided.
+
+        Returns:
+            str: The percent-encoded URI path for the route, starting
+            with `'/'`.
+
+        Raises:
+            KeyError: No route was registered with the given name.
+            ValueError: A required template field value is missing, an
+                unexpected field value was provided, or a value can not
+                be represented by its field converter.
+            NotImplementedError: One of the route's field converters does
+                not support reversing values (see also
+                :meth:`.BaseConverter.reverse`).
+
+        .. versionadded:: 4.4
+        """
+
+        try:
+            route = self._route_names[name]
+        except KeyError:
+            raise KeyError('No route found with the name: {0!r}'.format(name)) from None
+
+        provided = set(params)
+        missing = route.field_names - provided
+        if missing:
+            raise ValueError(
+                'Missing required URI template field value(s): {0}'.format(
+                    ', '.join(sorted(missing))
+                )
+            )
+
+        extra = provided - route.field_names
+        if extra:
+            raise ValueError(
+                'Unexpected URI template field value(s): {0}'.format(
+                    ', '.join(sorted(extra))
+                )
+            )
+
+        path_segments: list[str] = []
+        for segment in route.segments:
+            first_part = segment[0]
+            if (
+                len(segment) == 1
+                and isinstance(first_part, _TemplateField)
+                and first_part.consumes_multiple_segments
+            ):
+                # NOTE: A converter that consumes multiple segments is
+                #   always the only field in its segment; each rendered
+                #   segment is encoded individually so that a '/' within
+                #   a segment value can not alter the path structure.
+                converter = cast(converters.BaseConverter, first_part.converter)
+                reversed_value = converter.reverse(params[first_part.name])
+                if isinstance(reversed_value, str):
+                    reversed_value = reversed_value.split('/')
+                path_segments.extend(encode_value(part) for part in reversed_value)
+                continue
+
+            parts: list[str] = []
+            for part in segment:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif part.converter is None:
+                    parts.append(encode_value(str(params[part.name])))
+                else:
+                    parts.append(
+                        encode_value(
+                            cast(str, part.converter.reverse(params[part.name]))
+                        )
+                    )
+
+            path_segments.append(''.join(parts))
+
+        return '/' + '/'.join(path_segments)
+
     # -----------------------------------------------------------------
     # Private
     # -----------------------------------------------------------------
+
+    def _parse_uri_template(self, uri_template: str) -> list[list[_TemplatePart]]:
+        """Parse a URI template into segments of literal and field parts."""
+        segments: list[list[_TemplatePart]] = []
+
+        for segment_text in uri_template.lstrip('/').split('/'):
+            parts: list[_TemplatePart] = []
+            pos = 0
+
+            for field in _FIELD_PATTERN.finditer(segment_text):
+                if field.start() > pos:
+                    parts.append(segment_text[pos : field.start()])
+
+                converter = None
+                cname = field.group('cname')
+                if cname:
+                    converter = self._instantiate_converter(
+                        self._converter_map[cname], field.group('argstr')
+                    )
+
+                parts.append(_TemplateField(field.group('fname'), converter))
+                pos = field.end()
+
+            if pos < len(segment_text):
+                parts.append(segment_text[pos:])
+
+            segments.append(parts)
+
+        return segments
 
     def _require_coroutine_responders(self, method_map: MethodDict) -> None:
         for method, responder in method_map.items():
@@ -747,6 +926,35 @@ _NO_CHILDREN_ERR = (
 
 class UnacceptableRouteError(ValueError):
     """Error raised by ``add_error`` when a route is not acceptable."""
+
+
+class _TemplateField:
+    """A single field expression within a URI template segment."""
+
+    __slots__ = ('consumes_multiple_segments', 'converter', 'name')
+
+    def __init__(self, name: str, converter: converters.BaseConverter | None) -> None:
+        self.name = name
+        self.converter = converter
+        self.consumes_multiple_segments = (
+            converter is not None and converters._consumes_multiple_segments(converter)
+        )
+
+
+class _NamedRoute:
+    """A parsed URI template registered under a route name."""
+
+    __slots__ = ('field_names', 'segments', 'uri_template')
+
+    def __init__(self, uri_template: str, segments: list[list[_TemplatePart]]) -> None:
+        self.uri_template = uri_template
+        self.segments = segments
+        self.field_names = frozenset(
+            part.name
+            for segment in segments
+            for part in segment
+            if isinstance(part, _TemplateField)
+        )
 
 
 class CompiledRouterNode:

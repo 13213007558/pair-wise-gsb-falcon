@@ -717,6 +717,15 @@ class App(Generic[_ReqT, _RespT]):
                 since it will otherwise delay compilation until the first request
                 is routed. See :meth:`.CompiledRouter.add_route` for further details.
 
+            name (str): Optional unique name for this route, supported by the
+                default :class:`.CompiledRouter`. A named route's path can be
+                generated via :meth:`.App.url_for`. Custom routers may ignore
+                this keyword argument.
+
+                (See also: :ref:`routing_reverse`)
+
+                .. versionadded:: 4.4
+
         Note:
             Any additional keyword arguments not defined above are passed
             through to the underlying router's ``add_route()`` method. The
@@ -739,6 +748,45 @@ class App(Generic[_ReqT, _RespT]):
             raise ValueError("uri_template may not contain '//'")
 
         self._router.add_route(uri_template, resource, **kwargs)
+
+    # NOTE: The route name is a positional-only argument so that a URI
+    #   template field may itself be named "name".
+    def url_for(self, name: str, /, **params: Any) -> str:
+        """Generate the URI path for the route registered with the given name.
+
+        This method delegates to the configured router's `url_for()`
+        method, and is only supported when the router implements it (the
+        default :class:`.CompiledRouter` does). See
+        :meth:`.CompiledRouter.url_for` for further details.
+
+        (See also: :ref:`routing_reverse`)
+
+        Args:
+            name (str): The name that was assigned to the route via the
+                `name` keyword argument of :meth:`.App.add_route`.
+
+        Keyword Args:
+            **params: Values for the URI template fields of the route.
+                Exactly one value per template field must be provided.
+
+        Returns:
+            str: The percent-encoded URI path for the route, relative to
+            the application root.
+
+        Raises:
+            NotImplementedError: The configured router does not support
+                generating paths for named routes.
+
+        .. versionadded:: 4.4
+        """
+
+        router_url_for = getattr(self._router, 'url_for', None)
+        if router_url_for is None:
+            raise NotImplementedError(
+                'The configured router does not support url_for().'
+            )
+
+        return cast(str, router_url_for(name, **params))
 
     def add_static_route(
         self,
