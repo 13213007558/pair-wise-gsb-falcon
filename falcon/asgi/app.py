@@ -32,6 +32,7 @@ from typing import (
 import warnings
 
 from falcon import constants
+from falcon import negotiation
 from falcon import responders
 from falcon import routing
 from falcon._typing import _AReqT as _ReqT
@@ -604,6 +605,9 @@ class App(falcon.app.App[_ReqT, _RespT]):
         data: bytes | None = b''
 
         try:
+            if resource is not None:
+                negotiation.negotiate_response(req, resp, resource)
+
             # NOTE(vytas): It is only safe to inline Response.render_body()
             #   where we can be sure it hasn't been overridden, either directly
             #   or by modifying the behavior of its dependencies.

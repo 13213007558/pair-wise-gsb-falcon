@@ -99,37 +99,79 @@ implemented in a similar manner to the one above.
 Content-Type Negotiation
 ------------------------
 
-Falcon currently only supports partial negotiation out of the box. By default,
-when the ``get_media()`` method or the ``media`` attribute is used, the
-framework attempts to (de)serialize based on the ``Content-Type`` header value.
-The missing link that Falcon doesn't provide is the connection between the
-``Accept`` header provided by a user and the ``Content-Type`` header set on the
-response.
+Request deserialization and response serialization are independent. The
+request body is always decoded according to its ``Content-Type`` header (see
+:ref:`media`), and the response representation may be negotiated based on the
+request ``Accept`` header.
 
-If you do need full negotiation, it is very easy to bridge the gap using
-middleware. Here is an example of how this can be done:
+A resource opts in to response content negotiation by declaring the Internet
+media types it is able to produce with the :func:`~falcon.provides`
+decorator. When the responder sets :attr:`~falcon.Response.media`, Falcon
+selects the best match between the declared types and the request ``Accept``
+header before the body is serialized.
 
-.. tab-set::
+.. code:: python
 
-    .. tab-item:: WSGI
+    import falcon
 
-        .. code:: python
+    @falcon.provides('application/json', 'application/msgpack')
+    class SensorResource:
+        def on_get(self, req: Request, resp: Response) -> None:
+            resp.media = {'temperature': 21.5}
 
-            from falcon import Request, Response
+Selection follows :meth:`Request.client_prefers <falcon.Request.client_prefers>`
+and :func:`falcon.util.mediatypes.best_match`:
 
-            class NegotiationMiddleware:
-                def process_request(self, req: Request, resp: Response) -> None:
-                    resp.content_type = req.accept
+* Quality values (``q``) are taken into account.
+* More specific media ranges (exact ``type/subtype``) take precedence over
+  less specific ones (``type/*`` and ``*/*``).
+* A media type explicitly given a quality of zero (``q=0``) is excluded.
+* When several types are equally acceptable, the declaration order of the
+  arguments to :func:`~falcon.provides` is used as a stable tie-breaker.
 
-    .. tab-item:: ASGI
+Only the media types that have a registered
+:ref:`media handler <custom_media_handlers>` are offered during negotiation.
+If the client cannot accept any of them, Falcon raises
+:class:`~falcon.HTTPNotAcceptable` before attempting to serialize, so that no
+representation is rendered only to be discarded.
 
-        .. code:: python
+A missing ``Accept`` header is treated as ``*/*``, in which case the first
+declared media type is selected.
 
-            from falcon.asgi import Request, Response
+Negotiation does not change how the request ``Content-Type`` is handled:
+``req.media`` continues to deserialize the request body according to its own
+``Content-Type``, independently of the response representation. Error
+responses are serialized by the configured error serializer (see
+:meth:`~falcon.App.set_error_serializer`) and are not restricted to the
+resource's declared types.
 
-            class NegotiationMiddleware:
-                async def process_request(self, req: Request, resp: Response) -> None:
-                    resp.content_type = req.accept
+Overrides and Special Cases
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* If the responder (or response middleware) explicitly assigns a value to
+  :attr:`~falcon.Response.content_type`, the automatic negotiation is skipped
+  for that response and the assigned value is preserved as is. Falcon does
+  not overwrite, "correct", or reinterpret an explicit content type.
+* When Falcon performs the negotiation, it merges ``Accept`` into the
+  response ``Vary`` header, preserving any values that were already present
+  and avoiding duplicates.
+* Negotiation only applies to responses represented via
+  :attr:`~falcon.Response.media`. It is skipped for ``text``, ``data`` and
+  ``stream`` responses, as well as when there is no body to serialize, e.g.
+  for ``204 No Content`` responses.
+* ``HEAD`` requests still negotiate the response content type (the response
+  headers should describe the representation that a ``GET`` would produce),
+  but the negotiation itself never serializes the body. No representation is
+  rendered as part of choosing the content type.
+
+.. autofunction:: falcon.provides
+
+See :ref:`content_negotiation_recipe` for a complete example that uses the
+built-in JSON handler together with a standard-library ``text/csv`` handler.
+
+For more specialized needs, negotiation may also be implemented from scratch
+using middleware, for example by setting
+:attr:`~falcon.Response.content_type` from the value of the ``Accept`` header.
 
 
 Exception Handling

@@ -36,6 +36,7 @@ import warnings
 
 from falcon import app_helpers as helpers
 from falcon import constants
+from falcon import negotiation
 from falcon import responders
 from falcon import routing
 from falcon._typing import _ExcT
@@ -505,6 +506,9 @@ class App(Generic[_ReqT, _RespT]):
         length: int | None
 
         try:
+            if resource is not None:
+                negotiation.negotiate_response(req, resp, resource)
+
             body, length = self._get_body(resp, env.get('wsgi.file_wrapper'))
         except Exception as ex:
             if not self._handle_exception(req, resp, ex, params):
