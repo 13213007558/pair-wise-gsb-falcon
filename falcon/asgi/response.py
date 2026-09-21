@@ -76,8 +76,20 @@ class Response(response.Response):
 
     If the object assigned to :attr:`~.stream` holds any resources
     (such as a file handle) that must be explicitly released, the
-    object must implement a ``close()`` method. The ``close()`` method
-    will be called after exhausting the iterable or file-like object.
+    object may implement an ``aclose()`` or ``close()`` method
+    (async generators support the former out of the box). Falcon
+    awaits the closing method, preferring ``aclose()`` when both are
+    available, exactly once when the response has been fully sent,
+    as well as when streaming is aborted due to an error, a client
+    disconnect, or a cancellation of the request task.
+
+    .. versionchanged:: 4.4
+        Streams are now also closed when sending the response fails
+        before iteration has started, and async generators and
+        iterators are finalized via their ``aclose()`` method when
+        available. Previously, only the ``close()`` method was
+        supported, leaving async generators to be finalized by the
+        garbage collector.
 
     Note:
         In order to be compatible with Python 3.7+ and PEP 479,

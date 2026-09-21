@@ -91,6 +91,27 @@ _BODILESS_STATUS_CODES = frozenset([100, 101, 204, 304])
 
 _TYPELESS_STATUS_CODES = frozenset([204, 304])
 
+
+async def _close_stream(stream: Any) -> None:
+    """Close a response stream according to the protocol it supports.
+
+    Async generators and iterators are finalized via their ``aclose()``
+    method when available; file-like objects and other streams are closed
+    via ``close()``. Objects that implement neither method require no
+    cleanup, and are simply left as-is.
+
+    Args:
+        stream: The response stream to close.
+    """
+    closer = getattr(stream, 'aclose', None)
+    if closer is None:
+        closer = getattr(stream, 'close', None)
+        if closer is None:
+            return
+
+    await closer()
+
+
 _FALLBACK_WS_ERROR_CODE = 3011
 
 
@@ -826,26 +847,29 @@ class App(falcon.app.App[_ReqT, _RespT]):
         if not stream:
             resp._headers['content-length'] = '0'
 
-        await send(
-            {
-                # PERF(vytas): Inline the value of
-                #   EventType.HTTP_RESPONSE_START in this critical code path.
-                'type': 'http.response.start',
-                'status': resp_status,
-                'headers': resp._asgi_headers(default_media_type),
-            }
-        )
+        # NOTE: The stream (if any) is closed exactly once below, even when
+        #   sending the response start message fails before any iteration
+        #   has taken place, or when the task is cancelled mid-stream.
+        try:
+            await send(
+                {
+                    # PERF(vytas): Inline the value of
+                    #   EventType.HTTP_RESPONSE_START in this critical code path.
+                    'type': 'http.response.start',
+                    'status': resp_status,
+                    'headers': resp._asgi_headers(default_media_type),
+                }
+            )
 
-        if stream:
-            # Detect whether this is one of the following:
-            #
-            #   (a) async file-like object (e.g., aiofiles)
-            #   (b) async generator
-            #   (c) async iterator
-            #
+            if stream:
+                # Detect whether this is one of the following:
+                #
+                #   (a) async file-like object (e.g., aiofiles)
+                #   (b) async generator
+                #   (c) async iterator
+                #
 
-            if hasattr(stream, 'read'):
-                try:
+                if hasattr(stream, 'read'):
                     while True:
                         data = await stream.read(self._STREAM_BLOCK_SIZE)
                         if data == b'':
@@ -860,49 +884,62 @@ class App(falcon.app.App[_ReqT, _RespT]):
                                     'more_body': True,
                                 }
                             )
-                finally:
-                    if hasattr(stream, 'close'):
-                        await stream.close()
-            else:
-                # NOTE(kgriffs): Works for both async generators and iterators
-                try:
-                    async for data in stream:
-                        # NOTE(kgriffs): We can not rely on StopIteration
-                        #   because of Pep 479 that is implemented starting
-                        #   with Python 3.7. AFAICT this is only an issue
-                        #   when using an async iterator instead of an async
-                        #   generator.
-                        if data is None:
-                            break
+                else:
+                    # NOTE(kgriffs): Works for both async generators and
+                    #   iterators.
+                    try:
+                        async for data in stream:
+                            # NOTE(kgriffs): We can not rely on StopIteration
+                            #   because of Pep 479 that is implemented starting
+                            #   with Python 3.7. AFAICT this is only an issue
+                            #   when using an async iterator instead of an async
+                            #   generator.
+                            if data is None:
+                                break
 
-                        await send(
-                            {
-                                'type': EventType.HTTP_RESPONSE_BODY,
-                                'body': data,
-                                'more_body': True,
-                            }
-                        )
-                except TypeError as ex:
-                    if isasyncgenfunction(stream):
+                            await send(
+                                {
+                                    'type': EventType.HTTP_RESPONSE_BODY,
+                                    'body': data,
+                                    'more_body': True,
+                                }
+                            )
+                    except TypeError as ex:
+                        if isasyncgenfunction(stream):
+                            raise TypeError(
+                                'The object assigned to Response.stream '
+                                'appears to be an async generator function. A '
+                                'generator object is expected instead. This '
+                                'can be obtained simply by calling the '
+                                'generator function, e.g.: '
+                                'resp.stream = some_asyncgen_function()'
+                            )
+
                         raise TypeError(
-                            'The object assigned to Response.stream appears to '
-                            'be an async generator function. A generator '
-                            'object is expected instead. This can be obtained '
-                            'simply by calling the generator function, e.g.: '
-                            'resp.stream = some_asyncgen_function()'
+                            'Response.stream must be a generator or implement '
+                            'an __aiter__ method. Error raised while '
+                            'iterating over Response.stream: ' + str(ex)
                         )
+        except BaseException:
+            # NOTE: The response could not be fully sent (for example, the
+            #   client disconnected or the task was cancelled). The stream
+            #   is still closed promptly, but a secondary error raised while
+            #   closing it is suppressed in order to preserve the original
+            #   exception.
+            if stream:
+                try:
+                    await _close_stream(stream)
+                except Exception:
+                    pass
 
-                    raise TypeError(
-                        'Response.stream must be a generator or implement an '
-                        '__aiter__ method. Error raised while iterating over '
-                        'Response.stream: ' + str(ex)
-                    )
-                finally:
-                    # NOTE(vytas): This could be DRYed with the above identical
-                    #   twoliner in a one large block, but OTOH we would be
-                    #   unable to reuse the current try.. except.
-                    if hasattr(stream, 'close'):  # pragma: no py314 cover
-                        await stream.close()
+            raise
+
+        # NOTE: On the success path, an error raised while closing the
+        #   stream is propagated, and the final body event is not sent.
+        #   (See the TODO above, in the SSE block, regarding the py314
+        #   coverage pragma.)
+        if stream:  # pragma: no py314 cover
+            await _close_stream(stream)
 
         await send(_EVT_RESP_EOF)
 
