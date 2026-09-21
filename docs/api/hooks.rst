@@ -155,6 +155,52 @@ You can also create parameterized decorators:
         def on_get(self, req, resp) -> None:
             resp.media = {"Hello": "World"}
 
+.. _hook_execution_order:
+
+Hook Execution Order and Terminal States
+----------------------------------------
+
+When multiple hooks are stacked on a single responder, *before* hooks
+execute top-down (the outermost decorator first), while *after* hooks
+execute in the reverse order, innermost first::
+
+    @falcon.before(trace_request)   # runs first
+    @falcon.before(check_auth)      # runs second
+    @falcon.after(annotate)         # runs fourth
+    @falcon.after(audit)            # runs third
+    def on_get(self, req, resp):
+        ...
+
+Class-level hooks wrap the responder outside of any method-level hooks,
+so a class-level *before* hook runs before method-level ones, and a
+class-level *after* hook runs last.
+
+Each request resolves to exactly one terminal state for its hooks:
+
+* If a *before* hook raises, the responder and the *after* hooks are
+  skipped, and the exception is passed to the app's
+  :ref:`error handlers <errors>`.
+* If the responder raises, the *after* hooks are skipped in the same
+  manner.
+* If an *after* hook raises, any remaining *after* hooks for that
+  responder are skipped, and the exception is passed to the error
+  handlers.
+
+For streaming responses (i.e., when
+:attr:`resp.stream <falcon.Response.stream>` or
+:attr:`resp.sse <falcon.asgi.Response.sse>` is set), an *after* hook is
+considered complete as soon as the responder returns; it does **not**
+wait for the response body to finish streaming, and it is not invoked
+again afterwards. By the time the body is streamed, the response status
+and headers have already been sent, so an exception raised while
+iterating the stream can no longer be converted into an error response;
+it propagates to the application server instead.
+
+Similarly, when an ASGI client disconnects in the middle of a streamed
+response, the framework does not treat the disconnect as an error: per
+the ASGI spec, ``send()`` simply becomes a no-op, and no 500 response
+is synthesized.
+
 Before Hooks
 ------------
 
