@@ -163,6 +163,19 @@ Before Hooks
 After Hooks
 -----------
 
+An ``after`` hook completes after the responder returns, but before Falcon
+sends the response. For streaming responses
+(:attr:`falcon.Response.stream` for WSGI,
+:attr:`falcon.asgi.Response.stream` for ASGI), the hook is not delayed until
+every body chunk has been delivered or the client disconnects; the stream has
+only been assigned to the corresponding response attribute at that point.
+
+Consequently, an error raised by an ``after`` hook is still handled by the
+matching error handler and may replace the response. Once the response has
+started, an error raised while iterating the response stream or sending a
+later body chunk is propagated to the application server because the status
+line and headers can no longer be replaced with an error response.
+
 .. autofunction:: falcon.after
 
 Configuration of Hooks
