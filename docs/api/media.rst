@@ -80,6 +80,51 @@ do the heavy lifting for you.
     will only process request media the first time it is referenced. Subsequent
     interactions will use a cached object.
 
+.. _content-encoding:
+
+Content-Encoding
+----------------
+
+When a request arrives with a ``Content-Encoding`` header, Falcon
+transparently decodes the body as it is read, both for WSGI and ASGI apps.
+Currently, a single ``gzip`` (or ``x-gzip``) coding is supported, as well as
+``identity`` (no decoding). This applies uniformly to reading the request
+stream directly (``req.bounded_stream`` for WSGI, ``req.stream`` for ASGI)
+and to media deserialization via ``req.get_media()``.
+
+Note that the request's ``Content-Length`` header always refers to the
+compressed body on the wire; it is never used to truncate the decompressed
+output.
+
+To guard against decompression bombs, the decompressed output is limited by
+two :any:`falcon.RequestOptions` settings, both enforced incrementally while
+reading (once a limit is tripped, no further data is pulled from the request
+body stream):
+
+* :attr:`~falcon.RequestOptions.max_decompressed_body_size` -- maximum number
+  of decompressed bytes (default 32 MiB).
+* :attr:`~falcon.RequestOptions.max_decompression_ratio` -- maximum ratio of
+  decompressed to compressed bytes (default 100.0).
+
+The following errors may be raised while reading a content-encoded body
+(they are also cached and re-raised by repeated ``req.get_media()`` calls,
+without consuming the request body again):
+
+* :class:`~falcon.UnsupportedContentEncodingError` (415) -- the
+  ``Content-Encoding`` header lists an unsupported coding, or an unsupported
+  chain of multiple codings.
+* :class:`~falcon.ContentDecompressionError` (400) -- the compressed body is
+  corrupt, fails its CRC check, is truncated, or is followed by trailing
+  garbage bytes. A client disconnecting in the middle of the request body
+  also surfaces as a truncated stream. Partially decompressed data is never
+  returned as if it were complete.
+* :class:`~falcon.DecompressedContentTooLarge` (413) -- one of the
+  decompression limits described above was exceeded.
+
+When a client disconnects or a body is only partially read, the stream
+should be cleaned up as usual via ``exhaust()`` or ``close()``; both release
+any buffered data without surfacing further decompression errors.
+
 .. _media_validation:
 
 Validating Media

@@ -218,3 +218,12 @@ Predefined Errors
 
 .. autoclass:: falcon.MediaValidationError
     :members:
+
+.. autoclass:: falcon.UnsupportedContentEncodingError
+    :members:
+
+.. autoclass:: falcon.ContentDecompressionError
+    :members:
+
+.. autoclass:: falcon.DecompressedContentTooLarge
+    :members:

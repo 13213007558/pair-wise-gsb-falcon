@@ -33,6 +33,7 @@ __all__ = (
     'before',
     'BoundedStream',
     'CORSMiddleware',
+    'DecompressedStream',
     'HTTPError',
     'HTTPStatus',
     'HTTPFound',
@@ -103,6 +104,8 @@ __all__ = (
     'wrap_sync_to_async_unsafe',
     # Error classes
     'CompatibilityError',
+    'ContentDecompressionError',
+    'DecompressedContentTooLarge',
     'DelimiterError',
     'HeaderNotSupported',
     'HTTPBadGateway',
@@ -149,6 +152,7 @@ __all__ = (
     'MultipartParseError',
     'OperationNotAllowed',
     'PayloadTypeError',
+    'UnsupportedContentEncodingError',
     'UnsupportedError',
     'UnsupportedScopeError',
     'WebSocketDisconnected',
@@ -357,6 +361,8 @@ from falcon.constants import SINGLETON_HEADERS
 from falcon.constants import WEBDAV_METHODS
 from falcon.constants import WebSocketPayloadType
 from falcon.errors import CompatibilityError
+from falcon.errors import ContentDecompressionError
+from falcon.errors import DecompressedContentTooLarge
 from falcon.errors import DelimiterError
 from falcon.errors import HeaderNotSupported
 from falcon.errors import HTTPBadGateway
@@ -403,6 +409,7 @@ from falcon.errors import MediaValidationError
 from falcon.errors import MultipartParseError
 from falcon.errors import OperationNotAllowed
 from falcon.errors import PayloadTypeError
+from falcon.errors import UnsupportedContentEncodingError
 from falcon.errors import UnsupportedError
 from falcon.errors import UnsupportedScopeError
 from falcon.errors import WebSocketDisconnected
@@ -598,6 +605,7 @@ from falcon.status_codes import HTTP_UPGRADE_REQUIRED
 from falcon.status_codes import HTTP_USE_PROXY
 from falcon.status_codes import HTTP_VARIANT_ALSO_NEGOTIATES
 from falcon.stream import BoundedStream
+from falcon.stream import DecompressedStream
 
 # NOTE(kgriffs): Ensure that "from falcon import uri" will import
 #   the same front-door module as "import falcon.uri". This works by

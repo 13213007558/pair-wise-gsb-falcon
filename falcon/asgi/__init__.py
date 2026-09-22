@@ -30,6 +30,7 @@ from .app import App
 from .request import Request
 from .response import Response
 from .stream import BoundedStream
+from .stream import DecompressedStream
 from .structures import SSEvent
 from .ws import WebSocket
 from .ws import WebSocketOptions
@@ -37,6 +38,7 @@ from .ws import WebSocketOptions
 __all__ = (
     'App',
     'BoundedStream',
+    'DecompressedStream',
     'Request',
     'Response',
     'SSEvent',

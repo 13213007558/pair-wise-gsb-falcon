@@ -35,6 +35,9 @@ Request
 .. autoclass:: falcon.asgi.BoundedStream
     :members:
 
+.. autoclass:: falcon.asgi.DecompressedStream
+    :members:
+
 Response
 --------
 

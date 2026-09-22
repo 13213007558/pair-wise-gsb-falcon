@@ -347,11 +347,18 @@ class MultipartForm:
         # This approach makes testing both the Cythonized and pure-Python
         #   streams easier within the same test/benchmark suite.
         if not hasattr(stream, 'read_until'):
-            assert content_length is not None
             if isinstance(stream, BoundedStream):
+                assert content_length is not None
                 stream = BufferedReader(stream.stream.read, content_length)
             else:
-                stream = BufferedReader(stream.read, content_length)
+                # NOTE: content_length may be None when the stream is
+                #   transparently decompressed (Content-Encoding: gzip),
+                #   in which case the decompressed length is unknown up
+                #   front, and the stream is simply read until EOF.
+                stream = BufferedReader(
+                    stream.read,
+                    content_length if content_length is not None else 2**63,
+                )
 
         self._stream: PyBufferedReader = stream  # type: ignore[assignment]
         self._boundary = boundary

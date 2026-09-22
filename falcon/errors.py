@@ -53,6 +53,8 @@ if TYPE_CHECKING:
 __all__ = (
     'CompatibilityError',
     'DelimiterError',
+    'ContentDecompressionError',
+    'DecompressedContentTooLarge',
     'HeaderNotSupported',
     'HTTPBadGateway',
     'HTTPBadRequest',
@@ -98,6 +100,7 @@ __all__ = (
     'MultipartParseError',
     'OperationNotAllowed',
     'PayloadTypeError',
+    'UnsupportedContentEncodingError',
     'UnsupportedError',
     'UnsupportedScopeError',
     'WebSocketDisconnected',
@@ -2682,6 +2685,188 @@ class MediaValidationError(HTTPBadRequest):
             description=description,
             headers=headers,
             **kwargs,
+        )
+
+
+class UnsupportedContentEncodingError(HTTPUnsupportedMediaType):
+    """415 Unsupported Media Type.
+
+    Exception raised when the request's ``Content-Encoding`` header lists
+    a content coding that Falcon does not support, or an unsupported
+    chain of content codings.
+
+    Currently, only a single ``gzip`` (or ``x-gzip``) coding, as well as
+    ``identity``, can be decoded transparently. Any other coding, or a
+    chain of multiple codings (such as ``gzip, br``), results in this
+    error being raised when the request body stream is accessed.
+
+    Args:
+        encoding (str): The value of the request's ``Content-Encoding``
+            header that could not be handled.
+
+    Keyword Args:
+        headers (dict or list): A ``dict`` of header names and values
+            to set, or a ``list`` of (*name*, *value*) tuples. Both *name* and
+            *value* must be of type ``str`` or ``StringType``, and only
+            character values 0x00 through 0xFF may be used on platforms that
+            use wide characters.
+
+            Note:
+                The Content-Type header, if present, will be overridden. If
+                you wish to return custom error messages, you can create
+                your own HTTP error class, and install an error handler
+                to convert it into an appropriate HTTP response for the
+                client
+
+            Note:
+                Falcon can process a list of ``tuple`` slightly faster
+                than a ``dict``.
+        href (str): A URL someone can visit to find out more information
+            (default ``None``). Unicode characters are percent-encoded.
+        href_text (str): If href is given, use this as the friendly
+            title/description for the link (default 'API documentation
+            for this error').
+        code (int): An internal code that customers can reference in their
+            support request or to help them when searching for knowledge
+            base articles related to this error (default ``None``).
+    """
+
+    def __init__(
+        self, encoding: str, **kwargs: HeaderArg | HTTPErrorKeywordArguments
+    ) -> None:
+        super().__init__(
+            title='Unsupported content encoding',
+            description=(
+                'The content coding(s) specified in the Content-Encoding '
+                'header ({0}) are not supported by this server. Only a '
+                'single "gzip" coding, or "identity", can be decoded.'
+            ).format(encoding),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+class ContentDecompressionError(HTTPBadRequest):
+    """400 Bad Request.
+
+    Exception raised when a compressed request body cannot be
+    decompressed, for example because the gzip stream is corrupt,
+    fails its CRC check, is truncated, or is followed by trailing
+    garbage bytes.
+
+    This error is raised lazily, while the request body stream is being
+    read (including from within :meth:`~falcon.Request.get_media`). When
+    it is raised, no partially decompressed data is returned to the
+    caller as if it were complete.
+
+    Keyword Args:
+        description (str): Human-friendly description of the error
+            (default: a generic message about the compressed request
+            body being corrupt or truncated).
+        headers (dict or list): A ``dict`` of header names and values
+            to set, or a ``list`` of (*name*, *value*) tuples. Both *name* and
+            *value* must be of type ``str`` or ``StringType``, and only
+            character values 0x00 through 0xFF may be used on platforms that
+            use wide characters.
+
+            Note:
+                The Content-Type header, if present, will be overridden. If
+                you wish to return custom error messages, you can create
+                your own HTTP error class, and install an error handler
+                to convert it into an appropriate HTTP response for the
+                client
+
+            Note:
+                Falcon can process a list of ``tuple`` slightly faster
+                than a ``dict``.
+        href (str): A URL someone can visit to find out more information
+            (default ``None``). Unicode characters are percent-encoded.
+        href_text (str): If href is given, use this as the friendly
+            title/description for the link (default 'API documentation
+            for this error').
+        code (int): An internal code that customers can reference in their
+            support request or to help them when searching for knowledge
+            base articles related to this error (default ``None``).
+    """
+
+    def __init__(
+        self,
+        *,
+        description: str | None = None,
+        **kwargs: HeaderArg | HTTPErrorKeywordArguments,
+    ) -> None:
+        super().__init__(
+            title='Content decompression failed',
+            description=description
+            or 'The compressed request body is corrupt or truncated.',
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+class DecompressedContentTooLarge(HTTPContentTooLarge):
+    """413 Content Too Large.
+
+    Exception raised when a compressed request body exceeds the
+    configured decompression limits while being decoded, namely
+    :attr:`~falcon.RequestOptions.max_decompressed_body_size` (maximum
+    number of decompressed bytes) or
+    :attr:`~falcon.RequestOptions.max_decompression_ratio` (maximum
+    ratio of decompressed to compressed bytes).
+
+    The limit is enforced incrementally while reading the request body;
+    as soon as the decompressed output exceeds a limit, the error is
+    raised and no further data is pulled from the underlying request
+    body stream.
+
+    Keyword Args:
+        description (str): Human-friendly description of the error
+            (default: a generic message about the decompressed request
+            body exceeding the configured limit).
+        retry_after (datetime or int): Value for the Retry-After
+            header. If a ``datetime`` object, will serialize as an HTTP date.
+            Otherwise, a non-negative ``int`` is expected, representing the
+            number of seconds to wait.
+
+            Note:
+                The existing value of the Retry-After in headers will be
+                overridden by this value
+        headers (dict or list): A ``dict`` of header names and values
+            to set, or a ``list`` of (*name*, *value*) tuples. Both *name* and
+            *value* must be of type ``str`` or ``StringType``, and only
+            character values 0x00 through 0xFF may be used on platforms that
+            use wide characters.
+
+            Note:
+                The Content-Type header, if present, will be overridden. If
+                you wish to return custom error messages, you can create
+                your own HTTP error class, and install an error handler
+                to convert it into an appropriate HTTP response for the
+                client
+
+            Note:
+                Falcon can process a list of ``tuple`` slightly faster
+                than a ``dict``.
+        href (str): A URL someone can visit to find out more information
+            (default ``None``). Unicode characters are percent-encoded.
+        href_text (str): If href is given, use this as the friendly
+            title/description for the link (default 'API documentation
+            for this error').
+        code (int): An internal code that customers can reference in their
+            support request or to help them when searching for knowledge
+            base articles related to this error (default ``None``).
+    """
+
+    def __init__(
+        self,
+        *,
+        description: str | None = None,
+        **kwargs: HeaderArg | HTTPErrorKeywordArguments,
+    ) -> None:
+        super().__init__(
+            title='Decompressed content too large',
+            description=description
+            or 'The decompressed request body exceeds the limit configured '
+            'on the server.',
+            **kwargs,  # type: ignore[arg-type]
         )
 
 

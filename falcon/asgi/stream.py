@@ -21,9 +21,12 @@ from typing import NoReturn
 
 from falcon._typing import AsgiReceive
 from falcon.asgi_spec import AsgiEvent
+from falcon.errors import ContentDecompressionError
+from falcon.errors import DecompressedContentTooLarge
 from falcon.errors import OperationNotAllowed
+from falcon.util.decompression import GzipDecoder
 
-__all__ = ('BoundedStream',)
+__all__ = ('BoundedStream', 'DecompressedStream')
 
 
 class BoundedStream:
@@ -475,3 +478,248 @@ class BoundedStream:
             #   few more CPU cycles.
             if not ('more_body' in event and event['more_body']):
                 self._bytes_remaining = 0
+
+
+class DecompressedStream:
+    """Async file-like object that transparently decompresses a request body.
+
+    This class wraps an ASGI :class:`BoundedStream` (bounding the
+    compressed request body to the request's Content-Length) and yields
+    the decompressed bytes, much like reading the original,
+    uncompressed body. It mirrors the interface of
+    :class:`BoundedStream`, and also supports reading line by line via
+    :meth:`readline`.
+
+    The decompressed length is unknown up front; in particular, the
+    request's Content-Length header still refers to the compressed body
+    on the wire, and it is not used to truncate the decompressed output.
+
+    To guard against decompression bombs, the amount of decompressed
+    data is limited by *max_size* and *max_ratio* (see
+    :class:`falcon.util.decompression.GzipDecoder` for the exact
+    semantics). When a limit is exceeded,
+    :class:`falcon.errors.DecompressedContentTooLarge` is raised, and
+    no further data is pulled from the underlying stream. Corrupt,
+    truncated, or otherwise invalid gzip data results in
+    :class:`falcon.errors.ContentDecompressionError`. A truncated
+    stream also covers the case of a client disconnecting in the middle
+    of the request body.
+
+    Args:
+        stream: The ASGI :class:`BoundedStream` to read the compressed
+            request body from.
+
+    Keyword Args:
+        max_size (int): Maximum number of decompressed bytes to emit
+            (default `None`, i.e. no limit).
+        max_ratio (float): Maximum allowed ratio of decompressed to
+            compressed bytes (default `None`, i.e. no limit).
+        chunk_size (int): Maximum number of compressed bytes to pull
+            from the underlying stream at a time (default: 16 KiB).
+    """
+
+    __slots__ = (
+        '_buffer',
+        '_chunk_size',
+        '_closed',
+        '_decode_error',
+        '_decoder',
+        '_eof',
+        '_stream',
+    )
+
+    def __init__(
+        self,
+        stream: BoundedStream,
+        max_size: int | None = None,
+        max_ratio: float | None = None,
+        chunk_size: int = 16 * 1024,
+    ) -> None:
+        self._stream = stream
+        self._decoder = GzipDecoder(max_size, max_ratio)
+        self._chunk_size = chunk_size
+        self._buffer = bytearray()
+        self._closed = False
+        self._eof = False
+        self._decode_error: Exception | None = None
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._iter_content()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def eof(self) -> bool:
+        """Whether the stream is exhausted (all decompressed data read)."""
+        return self._eof and not self._buffer
+
+    def readable(self) -> bool:
+        """Return `True` always."""
+        return True
+
+    def seekable(self) -> bool:
+        """Return `False` always."""
+        return False
+
+    def writable(self) -> bool:
+        """Return `False` always."""
+        return False
+
+    def close(self) -> None:
+        """Clear any buffered data and close this stream.
+
+        The underlying stream is closed as well, releasing any request
+        body data still buffered by the framework. Once the stream is
+        closed, any operation on it will raise an instance of
+        :class:`ValueError`.
+
+        As a convenience, it is allowed to call this method more than
+        once; only the first call, however, will have an effect.
+        """
+        if not self._closed:
+            self._buffer.clear()
+            self._eof = True
+            self._closed = True
+            self._stream.close()
+
+    async def exhaust(self) -> None:
+        """Consume and immediately discard any remaining data in the stream.
+
+        The remaining compressed data is drained directly from the
+        underlying stream without decoding it, so that this method never
+        raises a decompression error.
+        """
+        if self._closed:
+            raise ValueError(
+                'This stream is closed; no further operations on it are permitted.'
+            )
+
+        self._buffer.clear()
+        self._eof = True
+        await self._stream.exhaust()
+
+    async def read(self, size: int | None = None) -> bytes:
+        """Read some or all of the remaining decompressed data.
+
+        Keyword Args:
+            size (int): The maximum number of (decompressed) bytes to
+                read. If the size is -1 or not specified, all remaining
+                data is read and returned.
+
+        Returns:
+            bytes: The decompressed data, or `b''` if the body is
+            empty or has already been consumed.
+        """
+        if self._closed:
+            raise OperationNotAllowed(
+                'This stream is closed; no further operations on it are permitted.'
+            )
+
+        if size is None or size < 0:
+            return await self.readall()
+
+        await self._fill(size)
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    async def readall(self) -> bytes:
+        """Read and return all remaining decompressed data in the body.
+
+        Warning:
+            Only use this method when you can be certain that you have
+            enough free memory for the entire request body. The
+            configured decompression limits still apply.
+
+        Returns:
+            bytes: The decompressed request body data, or `b''` if the
+            body is empty or has already been consumed.
+        """
+        if self._closed:
+            raise OperationNotAllowed(
+                'This stream is closed; no further operations on it are permitted.'
+            )
+
+        await self._fill(None)
+        data = bytes(self._buffer)
+        self._buffer.clear()
+        return data
+
+    async def readline(self, limit: int | None = None) -> bytes:
+        """Read a line of decompressed data from the stream.
+
+        Keyword Args:
+            limit (int): The maximum number of bytes to read. Defaults
+                to reading until a newline or EOF.
+
+        Returns:
+            bytes: The decompressed data, including the trailing
+            newline character, if any.
+        """
+        if self._closed:
+            raise OperationNotAllowed(
+                'This stream is closed; no further operations on it are permitted.'
+            )
+
+        if limit is not None and limit <= 0:
+            return b''
+
+        while True:
+            end = len(self._buffer) if limit is None else min(len(self._buffer), limit)
+            pos = self._buffer.find(b'\n', 0, end)
+            if pos >= 0:
+                pos += 1
+                line = bytes(self._buffer[:pos])
+                del self._buffer[:pos]
+                return line
+
+            if limit is not None and len(self._buffer) >= limit:
+                line = bytes(self._buffer[:limit])
+                del self._buffer[:limit]
+                return line
+
+            if self._eof:
+                line = bytes(self._buffer)
+                self._buffer.clear()
+                return line
+
+            await self._fill_more()
+
+    async def _fill_more(self) -> None:
+        if self._decode_error is not None:
+            raise self._decode_error
+
+        chunk = await self._stream.read(self._chunk_size)
+        try:
+            if chunk:
+                self._buffer += self._decoder.decompress(chunk)
+            else:
+                self._eof = True
+                self._buffer += self._decoder.flush()
+        except (
+            ContentDecompressionError,
+            DecompressedContentTooLarge,
+        ) as ex:
+            # NOTE: Make the error sticky so that repeated reads keep
+            #   failing without pulling any more data from the
+            #   underlying stream.
+            self._decode_error = ex
+            raise
+
+    async def _fill(self, size: int | None) -> None:
+        while not self._eof and (size is None or len(self._buffer) < size):
+            await self._fill_more()
+
+    async def _iter_content(self) -> AsyncIterator[bytes]:
+        if self._closed:
+            raise OperationNotAllowed(
+                'This stream is closed; no further operations on it are permitted.'
+            )
+
+        while True:
+            chunk = await self.read(self._chunk_size)
+            if not chunk:
+                break
+            yield chunk

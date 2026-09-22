@@ -43,6 +43,7 @@ from falcon.util.uri import parse_query_string
 
 from . import _request_helpers as asgi_helpers
 from .stream import BoundedStream
+from .stream import DecompressedStream
 
 __all__ = ('Request',)
 
@@ -97,7 +98,7 @@ class Request(request.Request):
     _cached_uri: str | None = None
     _media: UnsetOr[Any] = _UNSET
     _media_error: Exception | None = None
-    _stream: BoundedStream | None = None
+    _stream: BoundedStream | DecompressedStream | None = None
 
     scope: dict[str, Any]
     """Reference to the ASGI HTTP connection scope passed in
@@ -313,19 +314,39 @@ class Request(request.Request):
         return value_as_int
 
     @property
-    def stream(self) -> BoundedStream:  # type: ignore[override]
-        """File-like input object for reading the body of the request, if any."""
+    def stream(self) -> BoundedStream | DecompressedStream:  # type: ignore[override]
+        """File-like input object for reading the body of the request, if any.
+
+        Note:
+            When the request's ``Content-Encoding`` header is ``gzip``
+            (or ``x-gzip``), the returned stream transparently
+            decompresses the body as it is read; the Content-Length
+            header still refers to the compressed body on the wire.
+            See :attr:`falcon.RequestOptions.max_decompressed_body_size`
+            and :attr:`falcon.RequestOptions.max_decompression_ratio`
+            for the configurable limits guarding against decompression
+            bombs.
+        """
         if self.is_websocket:
             raise errors.UnsupportedError(
                 'ASGI does not support reading the WebSocket handshake request body.'
             )
 
         if not self._stream:
-            self._stream = BoundedStream(
+            bounded = BoundedStream(
                 self._receive,
                 first_event=self._first_event,
                 content_length=self.content_length,
             )
+
+            if self._get_content_coding() == 'gzip':
+                self._stream = DecompressedStream(
+                    bounded,
+                    max_size=self.options.max_decompressed_body_size,
+                    max_ratio=self.options.max_decompression_ratio,
+                )
+            else:
+                self._stream = bounded
 
         return self._stream
 
@@ -333,7 +354,7 @@ class Request(request.Request):
     #   from WSGI, but is not documented since we do not want people using
     #   it in greenfield ASGI apps.
     @property
-    def bounded_stream(self) -> BoundedStream:  # type: ignore[override]
+    def bounded_stream(self) -> BoundedStream | DecompressedStream:  # type: ignore[override]
         """Alias to :attr:`~.stream`."""
         return self.stream
 
@@ -631,11 +652,16 @@ class Request(request.Request):
         )
 
         try:
+            # NOTE: When the body is content-encoded, its decompressed
+            #   length is unknown up front; the Content-Length header
+            #   still refers to the compressed body on the wire, so it
+            #   must not be used to bound the decompressed stream.
+            content_length = None if self._get_content_coding() else self.content_length
             if deserialize_sync:
                 self._media = deserialize_sync(await self.stream.read())
             else:
                 self._media = await handler.deserialize_async(
-                    self.stream, self.content_type, self.content_length
+                    self.stream, self.content_type, content_length
                 )
 
         except errors.MediaNotFoundError as err:

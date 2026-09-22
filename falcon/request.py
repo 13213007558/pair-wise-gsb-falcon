@@ -46,11 +46,14 @@ from falcon.forwarded import Forwarded
 from falcon.media import Handlers
 from falcon.media.json import _DEFAULT_JSON_HANDLER
 from falcon.stream import BoundedStream
+from falcon.stream import DecompressedStream
 from falcon.typing import ReadableIO
 from falcon.util import deprecation
 from falcon.util import ETag
 from falcon.util import mediatypes
 from falcon.util import structures
+from falcon.util.decompression import DEFAULT_MAX_DECOMPRESSED_BODY_SIZE
+from falcon.util.decompression import DEFAULT_MAX_DECOMPRESSION_RATIO
 from falcon.util.uri import parse_host
 from falcon.util.uri import parse_query_string
 
@@ -320,7 +323,8 @@ class Request:
             self.content_type = None
 
         self.stream = env['wsgi.input']
-        self._bounded_stream: BoundedStream | None = None  # Lazy wrapping
+        # Lazy wrapping
+        self._bounded_stream: BoundedStream | DecompressedStream | None = None
 
         # PERF(kgriffs): Technically, we should spend a few more
         # cycles and parse the content type for real, but
@@ -450,7 +454,7 @@ class Request:
         return value_as_int
 
     @property
-    def bounded_stream(self) -> BoundedStream:
+    def bounded_stream(self) -> BoundedStream | DecompressedStream:
         """File-like wrapper around `stream` to normalize
         certain differences between the native input objects
         employed by different WSGI servers. In particular,
@@ -467,6 +471,15 @@ class Request:
         This is also safe::
 
             doc = json.load(req.bounded_stream)
+
+        Note:
+            When the request's ``Content-Encoding`` header is ``gzip``
+            (or ``x-gzip``), the returned stream transparently
+            decompresses the body as it is read; the Content-Length
+            header still refers to the compressed body on the wire.
+            See :attr:`RequestOptions.max_decompressed_body_size` and
+            :attr:`RequestOptions.max_decompression_ratio` for the
+            configurable limits guarding against decompression bombs.
         """  # noqa: D205
         if self._bounded_stream is None:
             self._bounded_stream = self._get_wrapped_wsgi_input()
@@ -1140,8 +1153,13 @@ class Request:
         )
 
         try:
+            # NOTE: When the body is content-encoded, its decompressed
+            #   length is unknown up front; the Content-Length header
+            #   still refers to the compressed body on the wire, so it
+            #   must not be used to bound the decompressed stream.
+            content_length = None if self._get_content_coding() else self.content_length
             self._media = handler.deserialize(
-                self.bounded_stream, self.content_type, self.content_length
+                self.bounded_stream, self.content_type, content_length
             )
         except errors.MediaNotFoundError as err:
             self._media_error = err
@@ -2711,7 +2729,7 @@ class Request:
     # Helpers
     # ------------------------------------------------------------------------
 
-    def _get_wrapped_wsgi_input(self) -> BoundedStream:
+    def _get_wrapped_wsgi_input(self) -> BoundedStream | DecompressedStream:
         try:
             content_length = self.content_length or 0
 
@@ -2722,7 +2740,47 @@ class Request:
             # but it had an invalid value. Assume no content.
             content_length = 0
 
-        return BoundedStream(self.env['wsgi.input'], content_length)
+        stream: BoundedStream | DecompressedStream = BoundedStream(
+            self.env['wsgi.input'], content_length
+        )
+
+        if self._get_content_coding() == 'gzip':
+            stream = DecompressedStream(
+                stream,
+                max_size=self.options.max_decompressed_body_size,
+                max_ratio=self.options.max_decompression_ratio,
+            )
+
+        return stream
+
+    def _get_content_coding(self) -> str | None:
+        """Parse the Content-Encoding header of the request.
+
+        Returns:
+            str: The single supported content coding (currently only
+            `'gzip'`), or `None` when the body is not encoded (or
+            only `identity` codings are listed).
+
+        Raises:
+            UnsupportedContentEncodingError: The header lists an
+                unsupported content coding, or an unsupported chain of
+                multiple codings.
+        """
+        header = self.get_header('Content-Encoding')
+        if not header:
+            return None
+
+        codings = [
+            coding.strip().lower() for coding in header.split(',') if coding.strip()
+        ]
+
+        if not codings or all(coding == 'identity' for coding in codings):
+            return None
+
+        if len(codings) == 1 and codings[0] in ('gzip', 'x-gzip'):
+            return 'gzip'
+
+        raise errors.UnsupportedContentEncodingError(header)
 
     def _parse_form_urlencoded(self) -> None:
         content_length = self.content_length
@@ -2869,6 +2927,35 @@ class RequestOptions:
     ``application/x-www-form-urlencoded`` and ``multipart/form-data`` media types.
     """
 
+    max_decompressed_body_size: int | None
+    """Maximum number of decompressed bytes allowed for a content-encoded
+    request body (default 32 MiB).
+
+    When a request arrives with a ``Content-Encoding`` of ``gzip`` (or
+    ``x-gzip``), the body is transparently decompressed as it is read
+    (see :attr:`Request.bounded_stream` and
+    :meth:`Request.get_media`). As soon as the decompressed output
+    exceeds this limit, :class:`~falcon.errors.DecompressedContentTooLarge`
+    (413) is raised, and no further data is pulled from the request body
+    stream.
+
+    Set to ``None`` to disable the limit.
+    """
+
+    max_decompression_ratio: float | None
+    """Maximum allowed ratio of decompressed to compressed request body
+    bytes (default 100.0).
+
+    This limit guards against decompression bombs: highly-compressible
+    bodies whose decompressed size grows disproportionately to the
+    compressed size received. As soon as the ratio of decompressed to
+    compressed bytes exceeds this limit,
+    :class:`~falcon.errors.DecompressedContentTooLarge` (413) is
+    raised, and no further data is pulled from the request body stream.
+
+    Set to ``None`` to disable the limit.
+    """
+
     __slots__ = (
         'keep_blank_qs_values',
         '_auto_parse_form_urlencoded',
@@ -2876,6 +2963,8 @@ class RequestOptions:
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
+        'max_decompressed_body_size',
+        'max_decompression_ratio',
     )
 
     def __init__(self) -> None:
@@ -2885,3 +2974,5 @@ class RequestOptions:
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
+        self.max_decompressed_body_size = DEFAULT_MAX_DECOMPRESSED_BODY_SIZE
+        self.max_decompression_ratio = DEFAULT_MAX_DECOMPRESSION_RATIO

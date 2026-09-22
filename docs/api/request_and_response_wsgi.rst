@@ -39,6 +39,9 @@ Request
 .. autoclass:: falcon.stream.BoundedStream
     :members:
 
+.. autoclass:: falcon.stream.DecompressedStream
+    :members:
+
 Response
 --------
 
