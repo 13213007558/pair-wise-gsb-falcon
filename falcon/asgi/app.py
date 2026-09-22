@@ -20,6 +20,7 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Iterable
 from inspect import isasyncgenfunction
+from inspect import isawaitable
 from inspect import iscoroutinefunction
 import traceback
 from typing import (
@@ -657,6 +658,17 @@ class App(falcon.app.App[_ReqT, _RespT]):
             default_media_type: str | None = self.resp_options.default_media_type
 
             if req.method == 'HEAD' or resp_status in _BODILESS_STATUS_CODES:
+                # The body is suppressed for HEAD and bodiless statuses;
+                #   close any response stream so that its underlying
+                #   resources (e.g., an open file) are not leaked.
+                stream = resp.stream
+                if stream is not None:
+                    close_stream = getattr(stream, 'close', None)
+                    if close_stream is not None:
+                        closing = close_stream()
+                        if isawaitable(closing):
+                            await closing
+
                 #
                 # PERF(vytas): move check for the less common and much faster path
                 # of resp_status being in {204, 304} here; NB: this builds on the

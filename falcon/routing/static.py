@@ -13,6 +13,7 @@ from typing import Any, ClassVar, IO, TYPE_CHECKING
 
 import falcon
 from falcon.typing import ReadableIO
+from falcon.util import http_date_to_dt
 
 if TYPE_CHECKING:
     from falcon import asgi
@@ -103,14 +104,68 @@ def _is_not_modified(
     #   https://www.rfc-editor.org/rfc/rfc9110#section-13.1.3-5
     #   https://www.rfc-editor.org/rfc/rfc9110#section-13.2.2
     if req.if_none_match is not None:
+        # If-None-Match uses the weak comparison function (RFC 9110,
+        #   Section 8.8.3.2): two entity-tags match when their opaque tags
+        #   match character-by-character, regardless of weakness. Since
+        #   ETag is a str subclass holding just the opaque tag, the ==
+        #   operator performs exactly this comparison.
         return (len(req.if_none_match) == 1 and req.if_none_match[0] == '*') or any(
             current_etag == etag for etag in req.if_none_match
         )
 
     if req.if_modified_since is not None:
+        # HTTP dates carry one-second precision, and last_modified
+        #   has already been truncated to whole seconds, so a plain
+        #   comparison of the two datetimes is sufficient.
         return last_modified <= req.if_modified_since
 
     return False
+
+
+def _is_range_request_enabled(
+    req: falcon.Request, current_etag: str, last_modified: datetime
+) -> bool:
+    """Check the If-Range header to decide whether to honor a Range request.
+
+    Per RFC 9110, Section 14.5, a Range request is only honored when the
+    If-Range validator matches the current representation; otherwise, the
+    Range header field is ignored, and the full representation is served
+    with a 200 OK response.
+
+    Args:
+        req: The request object.
+        current_etag (str): The opaque tag of the current representation.
+        last_modified (datetime): The last-modified time of the current
+            representation, truncated to whole seconds.
+
+    Returns:
+        bool: ``True`` if the Range header field should be honored.
+    """
+    if_range = req.if_range
+    if if_range is None:
+        return True
+
+    if_range = if_range.strip()
+
+    if if_range.startswith(('"', 'W/"', 'w/"')):
+        # An entity-tag validator must match using the strong
+        #   comparison function (RFC 9110, Section 8.8.3.2): both tags
+        #   must be strong, and their opaque tags must match
+        #   character-by-character. A weak If-Range validator therefore
+        #   never matches, and the Range header field is ignored.
+        return falcon.ETag(current_etag).strong_compare(falcon.ETag.loads(if_range))
+
+    try:
+        if_range_date = http_date_to_dt(if_range)
+    except ValueError:
+        # An unrecognized If-Range value can never match, so the
+        #   Range header field is ignored.
+        return False
+
+    # HTTP dates carry one-second precision, and last_modified has
+    #   already been truncated to whole seconds, so an exact match means
+    #   the client already holds the current representation.
+    return if_range_date == last_modified
 
 
 class _BoundedFile:
@@ -168,6 +223,24 @@ class StaticRoute:
                 Content-Disposition header (provided it was requested with the
                 `downloadable` parameter described above), are derived from the
                 fallback filename, as opposed to the requested filename.
+
+    Conditional and range requests are handled according to a single
+    precedence order, shared by GET and HEAD requests (a HEAD response
+    carries the same status and headers as its GET equivalent, but no
+    body):
+
+    1.  ``If-None-Match`` (weak ETag comparison) and ``If-Modified-Since``
+        (one-second date precision) are evaluated first; a cache hit
+        short-circuits to ``304 Not Modified``, and any ``Range`` header
+        field is disregarded.
+    2.  ``If-Range`` is evaluated next; when its entity-tag (strong
+        comparison) or HTTP-date validator does not match the current
+        representation, the ``Range`` header field is ignored, and the
+        full representation is served with ``200 OK``.
+    3.  A satisfiable ``bytes`` range yields ``206 Partial Content``
+        (requested ranges are clamped to the representation bounds), an
+        unsatisfiable one results in ``416 Range Not Satisfiable``, and a
+        missing or ignored ``Range`` falls through to ``200 OK``.
     """
 
     # NOTE(kgriffs): Don't allow control characters and reserved chars
@@ -284,7 +357,24 @@ class StaticRoute:
             resp.status = falcon.HTTP_304
             return
 
-        req_range = req.range if req.range_unit == 'bytes' else None
+        # Conditional requests, If-Range, and Range processing share
+        #   a single precedence order for GET and HEAD alike (the app
+        #   suppresses the body of a HEAD response when finalizing it,
+        #   while keeping the status and headers computed here):
+        #
+        #   1. If-None-Match and If-Modified-Since are evaluated first
+        #      (above); a cache hit short-circuits to 304 Not Modified,
+        #      and any Range header field is disregarded.
+        #   2. If-Range is evaluated next; when its validator does not
+        #      strongly match the current representation, the Range
+        #      header field is ignored, and the full representation is
+        #      served with 200 OK.
+        #   3. A satisfiable bytes Range yields 206 Partial Content, an
+        #      unsatisfiable one raises 416 Range Not Satisfiable, and a
+        #      missing or ignored Range falls through to 200 OK.
+        req_range = None
+        if _is_range_request_enabled(req, etag, last_modified):
+            req_range = req.range if req.range_unit == 'bytes' else None
         try:
             stream, length, content_range = _set_range(fh, st, req_range)
         except OSError:

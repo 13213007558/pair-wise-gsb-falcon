@@ -1,3 +1,5 @@
+import io
+
 import pytest
 
 import falcon
@@ -23,6 +25,43 @@ def test_append_body(resp):
 def test_response_repr(resp):
     _repr = f'<{resp.__class__.__name__}: {resp.status}>'
     assert resp.__repr__() == _repr
+
+
+def test_head_request_closes_stream(asgi, util):
+    stream = io.BytesIO(b'Hello, World!')
+
+    class Resource:
+        def on_get(self, req, resp):
+            resp.set_stream(stream, len(b'Hello, World!'))
+
+        on_head = on_get
+
+    app = util.create_app(asgi)
+    app.add_route('/', Resource())
+
+    result = testing.simulate_head(app, '/')
+
+    assert result.status_code == 200
+    assert result.content == b''
+    assert result.headers['content-length'] == '13'
+    assert stream.closed
+
+
+def test_head_request_stream_without_close(asgi, util):
+    class Resource:
+        def on_get(self, req, resp):
+            # A plain iterator does not expose a close() method.
+            resp.stream = iter([b'Hello, World!'])
+
+        on_head = on_get
+
+    app = util.create_app(asgi)
+    app.add_route('/', Resource())
+
+    result = testing.simulate_head(app, '/')
+
+    assert result.status_code == 200
+    assert result.content == b''
 
 
 def test_content_length_set_on_head_with_no_body(asgi, util):

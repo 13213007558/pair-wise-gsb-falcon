@@ -521,6 +521,15 @@ class App(Generic[_ReqT, _RespT]):
             default_media_type: str | None = self.resp_options.default_media_type
 
             if req.method == 'HEAD' or resp_status in _BODILESS_STATUS_CODES:
+                # The body is suppressed for HEAD and bodiless statuses;
+                #   close any response stream so that its underlying
+                #   resources (e.g., an open file) are not leaked.
+                stream = resp.stream
+                if stream is not None:
+                    close_stream = getattr(stream, 'close', None)
+                    if close_stream is not None:
+                        close_stream()
+
                 body = []
 
                 # PERF(vytas): move check for the less common and much faster path

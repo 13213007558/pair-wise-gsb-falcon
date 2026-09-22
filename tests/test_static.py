@@ -757,3 +757,210 @@ def test_if_none_match_precedence(client, patch_open):
     )
     assert resp2.status == falcon.HTTP_304
     assert resp2.text == ''
+
+
+_STATIC_CONTENT = b'0123456789abcdef'
+_STATIC_MTIME = 1736617934
+_STATIC_LAST_MODIFIED = 'Sat, 11 Jan 2025 17:52:14 GMT'
+_STATIC_ETAG = '"6782afce-10"'
+
+
+@pytest.fixture()
+def static_file_client(client, patch_open):
+    patch_open(_STATIC_CONTENT, mtime=_STATIC_MTIME)
+    client.app.add_static_route('/assets/', '/opt/somesite/assets')
+    return client
+
+
+@pytest.mark.parametrize(
+    'if_range, exp_status, exp_content',
+    [
+        # Strong entity-tag match; the range is honored.
+        (_STATIC_ETAG, falcon.HTTP_206, b'4567'),
+        ('  ' + _STATIC_ETAG + '  ', falcon.HTTP_206, b'4567'),
+        # A weak entity-tag never matches under the strong comparison.
+        ('W/"6782afce-10"', falcon.HTTP_200, _STATIC_CONTENT),
+        # A different entity-tag does not match.
+        ('"6782afce-11"', falcon.HTTP_200, _STATIC_CONTENT),
+        # A prefix of the opaque tag is not a match either.
+        ('"6782afce"', falcon.HTTP_200, _STATIC_CONTENT),
+        # Exact HTTP-date match; the range is honored.
+        (_STATIC_LAST_MODIFIED, falcon.HTTP_206, b'4567'),
+        # The resource is newer or older than the given date.
+        ('Sat, 11 Jan 2025 17:52:13 GMT', falcon.HTTP_200, _STATIC_CONTENT),
+        ('Sat, 11 Jan 2025 17:52:15 GMT', falcon.HTTP_200, _STATIC_CONTENT),
+        # An unrecognized validator can never match.
+        ('not-a-validator', falcon.HTTP_200, _STATIC_CONTENT),
+    ],
+)
+def test_if_range(static_file_client, if_range, exp_status, exp_content):
+    resp = static_file_client.simulate_get(
+        '/assets/css/main.css',
+        headers={'Range': 'bytes=4-7', 'If-Range': if_range},
+    )
+
+    assert resp.status == exp_status
+    assert resp.content == exp_content
+    assert int(resp.headers['Content-Length']) == len(exp_content)
+    assert resp.headers['ETag'] == _STATIC_ETAG
+    assert resp.headers['Last-Modified'] == _STATIC_LAST_MODIFIED
+    assert resp.headers['Accept-Ranges'] == 'bytes'
+    if exp_status == falcon.HTTP_206:
+        assert resp.headers['Content-Range'] == 'bytes 4-7/16'
+    else:
+        assert 'Content-Range' not in resp.headers
+
+
+def test_if_range_without_range_header(static_file_client):
+    resp = static_file_client.simulate_get(
+        '/assets/css/main.css',
+        headers={'If-Range': '"stale-etag"'},
+    )
+
+    assert resp.status == falcon.HTTP_200
+    assert resp.content == _STATIC_CONTENT
+    assert 'Content-Range' not in resp.headers
+
+
+def test_unsatisfiable_range_with_matching_if_range(static_file_client):
+    resp = static_file_client.simulate_get(
+        '/assets/css/main.css',
+        headers={'Range': 'bytes=100-200', 'If-Range': _STATIC_ETAG},
+    )
+
+    assert resp.status == falcon.HTTP_416
+    assert resp.headers['Content-Range'] == 'bytes */16'
+
+
+def test_if_none_match_takes_precedence_over_range(static_file_client, patch_open):
+    resp = static_file_client.simulate_get(
+        '/assets/css/main.css',
+        headers={'If-None-Match': _STATIC_ETAG, 'Range': 'bytes=4-7'},
+    )
+
+    assert resp.status == falcon.HTTP_304
+    assert resp.content == b''
+    assert 'Content-Range' not in resp.headers
+    assert patch_open.current_file.closed
+
+
+def test_if_modified_since_takes_precedence_over_range(static_file_client, patch_open):
+    resp = static_file_client.simulate_get(
+        '/assets/css/main.css',
+        headers={'If-Modified-Since': _STATIC_LAST_MODIFIED, 'Range': 'bytes=4-7'},
+    )
+
+    assert resp.status == falcon.HTTP_304
+    assert resp.content == b''
+    assert 'Content-Range' not in resp.headers
+    assert patch_open.current_file.closed
+
+
+@pytest.mark.parametrize(
+    'range_header, exp_content_range, exp_content',
+    [
+        # Suffix ranges.
+        ('bytes=-5', 'bytes 11-15/16', b'bcdef'),
+        ('bytes=-16', 'bytes 0-15/16', _STATIC_CONTENT),
+        # Ranges are clamped (merged) to the representation bounds.
+        ('bytes=-100', 'bytes 0-15/16', _STATIC_CONTENT),
+        ('bytes=10-100', 'bytes 10-15/16', b'abcdef'),
+        ('bytes=0-100', 'bytes 0-15/16', _STATIC_CONTENT),
+    ],
+)
+def test_range_suffix_and_clamped(
+    static_file_client, range_header, exp_content_range, exp_content
+):
+    resp = static_file_client.simulate_get(
+        '/assets/css/main.css',
+        headers={'Range': range_header},
+    )
+
+    assert resp.status == falcon.HTTP_206
+    assert resp.headers['Content-Range'] == exp_content_range
+    assert int(resp.headers['Content-Length']) == len(exp_content)
+    assert resp.content == exp_content
+
+
+def test_head_request(static_file_client, patch_open):
+    resp = static_file_client.simulate_head('/assets/css/main.css')
+
+    assert resp.status == falcon.HTTP_200
+    assert resp.content == b''
+    assert resp.headers['Content-Length'] == str(len(_STATIC_CONTENT))
+    assert resp.headers['ETag'] == _STATIC_ETAG
+    assert resp.headers['Last-Modified'] == _STATIC_LAST_MODIFIED
+    assert resp.headers['Accept-Ranges'] == 'bytes'
+    assert patch_open.current_file.closed
+
+
+def test_head_request_with_range(static_file_client, patch_open):
+    resp = static_file_client.simulate_head(
+        '/assets/css/main.css',
+        headers={'Range': 'bytes=4-7'},
+    )
+
+    assert resp.status == falcon.HTTP_206
+    assert resp.content == b''
+    assert resp.headers['Content-Range'] == 'bytes 4-7/16'
+    assert resp.headers['Content-Length'] == '4'
+    assert patch_open.current_file.closed
+
+
+def test_head_request_cache_hit(static_file_client, patch_open):
+    resp = static_file_client.simulate_head(
+        '/assets/css/main.css',
+        headers={'If-None-Match': _STATIC_ETAG},
+    )
+
+    assert resp.status == falcon.HTTP_304
+    assert resp.content == b''
+    assert patch_open.current_file.closed
+
+
+def test_head_request_if_range_mismatch(static_file_client, patch_open):
+    resp = static_file_client.simulate_head(
+        '/assets/css/main.css',
+        headers={'Range': 'bytes=4-7', 'If-Range': '"stale-etag"'},
+    )
+
+    assert resp.status == falcon.HTTP_200
+    assert resp.content == b''
+    assert resp.headers['Content-Length'] == str(len(_STATIC_CONTENT))
+    assert 'Content-Range' not in resp.headers
+    assert patch_open.current_file.closed
+
+
+def test_stream_read_error(client, monkeypatch):
+    content = b'0123456789abcdef'
+
+    class BrokenFile(io.BytesIO):
+        def read(self, size=-1):
+            raise OSError('simulated read failure')
+
+    class FakeFD(int):
+        pass
+
+    class FakeStat:
+        st_size = len(content)
+        st_mtime = 1736617934
+
+    opened_files = []
+
+    def open(path, mode):
+        fh = BrokenFile(content)
+        fd = FakeFD(1337)
+        fd._stat = FakeStat()
+        fh.fileno = lambda: fd
+        opened_files.append(fh)
+        return fh
+
+    monkeypatch.setattr(io, 'open', open)
+    monkeypatch.setattr(os, 'fstat', lambda fileno: fileno._stat)
+
+    client.app.add_static_route('/assets/', '/opt/somesite/assets')
+
+    with pytest.raises(OSError):
+        client.simulate_get('/assets/css/main.css')
+
+    assert opened_files[0].closed
