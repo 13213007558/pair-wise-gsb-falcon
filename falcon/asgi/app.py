@@ -74,7 +74,8 @@ from ._asgi_helpers import _wrap_asgi_coroutine_func
 from .multipart import MultipartForm
 from .request import Request
 from .response import Response
-from .structures import SSEvent
+from .sse import _SSEConnection
+from .sse import SSEOptions
 from .ws import _supports_reason
 from .ws import http_status_to_ws_code
 from .ws import WebSocket
@@ -346,6 +347,7 @@ class App(falcon.app.App[_ReqT, _RespT]):
     __slots__ = (
         '_standard_response_type',
         '_middleware_ws',
+        'sse_options',
         'ws_options',
     )
 
@@ -360,6 +362,12 @@ class App(falcon.app.App[_ReqT, _RespT]):
     """A set of behavioral options related to WebSocket connections.
 
     See also: :class:`~.WebSocketOptions`.
+    """
+
+    sse_options: SSEOptions
+    """A set of behavioral options related to Server-Sent Events connections.
+
+    See also: :class:`~.SSEOptions`.
     """
 
     @overload
@@ -447,6 +455,7 @@ class App(falcon.app.App[_ReqT, _RespT]):
         )
 
         self.ws_options = WebSocketOptions()
+        self.sse_options = SSEOptions()
         self._standard_response_type = response_type in (None, Response)
 
         self.add_error_handler(
@@ -762,17 +771,6 @@ class App(falcon.app.App[_ReqT, _RespT]):
                     'resp.sse = some_asyncgen_function()'
                 )
 
-            # NOTE(kgriffs): This must be done in a separate task because
-            #   receive() can block for some time (until the connection is
-            #   actually closed).
-            async def watch_disconnect() -> None:
-                while True:
-                    received_event = await receive()
-                    if received_event['type'] == EventType.HTTP_DISCONNECT:
-                        break
-
-            watcher = asyncio.create_task(watch_disconnect())
-
             await send(
                 {
                     'type': EventType.HTTP_RESPONSE_START,
@@ -790,36 +788,14 @@ class App(falcon.app.App[_ReqT, _RespT]):
                 MEDIA_JSON, MEDIA_JSON, raise_not_found=False
             )
 
-            # TODO(kgriffs): Do we need to do anything special to handle when
-            #   a connection is closed?
-            async for event in sse_emitter:
-                if not event:
-                    event = SSEvent()
-
-                # NOTE(kgriffs): According to the ASGI spec, once the client
-                #   disconnects, send() acts as a no-op. We have to check
-                #   the connection state using watch_disconnect() above.
-                await send(
-                    {
-                        'type': EventType.HTTP_RESPONSE_BODY,
-                        'body': event.serialize(sse_handler),
-                        'more_body': True,
-                    }
-                )
-
-                if watcher.done():  # pragma: no py39,py310 cover
-                    break
-
-            # TODO(vytas): Remove these py314 pragmas here and in reader.py if
-            #   https://github.com/nedbat/coveragepy/issues/1999 gets resolved
-            #   before CPython 3.14.0 stable is out.
-            watcher.cancel()  # pragma: no py314 cover
-            try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
-
-            await send({'type': EventType.HTTP_RESPONSE_BODY})
+            connection = _SSEConnection(
+                sse_emitter,
+                send,
+                receive,
+                json_handler=sse_handler,
+                options=self.sse_options,
+            )
+            await connection.run()
             return
 
         stream = resp.stream

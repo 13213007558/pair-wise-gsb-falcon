@@ -29,6 +29,7 @@ that of the module in question.
 from .app import App
 from .request import Request
 from .response import Response
+from .sse import SSEOptions
 from .stream import BoundedStream
 from .structures import SSEvent
 from .ws import WebSocket
@@ -40,6 +41,7 @@ __all__ = (
     'Request',
     'Response',
     'SSEvent',
+    'SSEOptions',
     'WebSocket',
     'WebSocketOptions',
 )

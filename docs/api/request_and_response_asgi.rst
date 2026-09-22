@@ -45,3 +45,6 @@ Response
 
 .. autoclass:: falcon.asgi.SSEvent
     :members:
+
+.. autoclass:: falcon.asgi.SSEOptions
+    :members:

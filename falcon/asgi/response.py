@@ -135,6 +135,11 @@ class Response(response.Response):
             When hosting an app that emits Server-Sent Events, the web
             server should be set with a relatively long keep-alive TTL to
             minimize the overhead of connection renegotiations.
+
+        Note:
+            Heartbeat frames, the final terminator frame, and other
+            connection behaviors can be customized via
+            :attr:`falcon.asgi.App.sse_options`.
         """  # noqa: D400 D205
         return self._sse
 
