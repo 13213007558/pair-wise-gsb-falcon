@@ -69,12 +69,12 @@ from falcon.util.sync import _should_wrap_non_coroutines
 from falcon.util.sync import _wrap_non_coroutine_unsafe
 from falcon.util.sync import wrap_sync_to_async
 
+from . import _sse
 from ._asgi_helpers import _validate_asgi_scope
 from ._asgi_helpers import _wrap_asgi_coroutine_func
 from .multipart import MultipartForm
 from .request import Request
 from .response import Response
-from .structures import SSEvent
 from .ws import _supports_reason
 from .ws import http_status_to_ws_code
 from .ws import WebSocket
@@ -762,17 +762,6 @@ class App(falcon.app.App[_ReqT, _RespT]):
                     'resp.sse = some_asyncgen_function()'
                 )
 
-            # NOTE(kgriffs): This must be done in a separate task because
-            #   receive() can block for some time (until the connection is
-            #   actually closed).
-            async def watch_disconnect() -> None:
-                while True:
-                    received_event = await receive()
-                    if received_event['type'] == EventType.HTTP_DISCONNECT:
-                        break
-
-            watcher = asyncio.create_task(watch_disconnect())
-
             await send(
                 {
                     'type': EventType.HTTP_RESPONSE_START,
@@ -790,36 +779,28 @@ class App(falcon.app.App[_ReqT, _RespT]):
                 MEDIA_JSON, MEDIA_JSON, raise_not_found=False
             )
 
-            # TODO(kgriffs): Do we need to do anything special to handle when
-            #   a connection is closed?
-            async for event in sse_emitter:
-                if not event:
-                    event = SSEvent()
+            sse_terminal = resp._sse_terminal
+            if sse_terminal is not None and not isinstance(sse_terminal, bytes):
+                sse_terminal = sse_terminal.serialize(sse_handler)
 
-                # NOTE(kgriffs): According to the ASGI spec, once the client
-                #   disconnects, send() acts as a no-op. We have to check
-                #   the connection state using watch_disconnect() above.
-                await send(
-                    {
-                        'type': EventType.HTTP_RESPONSE_BODY,
-                        'body': event.serialize(sse_handler),
-                        'more_body': True,
-                    }
-                )
-
-                if watcher.done():  # pragma: no py39,py310 cover
-                    break
-
-            # TODO(vytas): Remove these py314 pragmas here and in reader.py if
-            #   https://github.com/nedbat/coveragepy/issues/1999 gets resolved
-            #   before CPython 3.14.0 stable is out.
-            watcher.cancel()  # pragma: no py314 cover
             try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
+                await _sse.pump_events(
+                    send,
+                    receive,
+                    sse_emitter,
+                    sse_handler,
+                    queue_maxsize=_sse.QUEUE_MAXSIZE,
+                    cleanup_timeout=_sse.CLEANUP_TIMEOUT,
+                    terminal_frame=sse_terminal,
+                    heartbeat_interval=resp._sse_heartbeat,
+                )
+            finally:
+                # NOTE: Release the references held by the response so that
+                #   the emitter (and anything it may be holding on to) is
+                #   not kept alive any longer than necessary.
+                resp._sse = None
+                resp._sse_terminal = None
 
-            await send({'type': EventType.HTTP_RESPONSE_BODY})
             return
 
         stream = resp.stream

@@ -23,7 +23,11 @@ from inspect import iscoroutinefunction
 from typing import (
     Callable,
     Literal,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    from falcon.asgi.structures import SSEvent
 
 from falcon import response
 from falcon._typing import _UNSET
@@ -50,6 +54,8 @@ class Response(response.Response):
     #   us avoid having to implement __init__ and incur the overhead of
     #   an additional function call.
     _sse: SSEEmitter | None = None
+    _sse_heartbeat: float | None = None
+    _sse_terminal: SSEvent | bytes | None = None
     _registered_callbacks: list[ResponseCallbacks] | None = None
 
     stream: AsyncReadableIO | AsyncIterator[bytes] | None  # type: ignore[assignment]
@@ -141,6 +147,45 @@ class Response(response.Response):
     @sse.setter
     def sse(self, value: SSEEmitter | None) -> None:
         self._sse = value
+
+    @property
+    def sse_heartbeat(self) -> float | None:
+        """Heartbeat interval, in seconds, for the SSE emitter.
+
+        When the emitter assigned to :attr:`~falcon.asgi.Response.sse`
+        does not produce any event for this many seconds, a "ping"
+        comment frame is automatically sent to the client in order to
+        keep the connection alive. Defaults to ``None``, meaning no
+        heartbeat frames are emitted.
+        """
+        return self._sse_heartbeat
+
+    @sse_heartbeat.setter
+    def sse_heartbeat(self, value: float | None) -> None:
+        self._sse_heartbeat = value
+
+    @property
+    def sse_terminal(self) -> SSEvent | bytes | None:
+        """Terminal event to send when the SSE emitter completes.
+
+        When the emitter assigned to :attr:`~falcon.asgi.Response.sse`
+        is exhausted normally, this event is serialized and sent to the
+        client as the final event frame, just before the response is
+        concluded. The value may be a :class:`~falcon.asgi.SSEvent`
+        instance (or anything providing a compatible ``serialize()``
+        method) or a pre-serialized byte string. Defaults to ``None``,
+        meaning no terminal frame is sent.
+
+        Note:
+            The terminal event is only sent upon normal completion; it
+            is skipped when the client disconnects prematurely or when
+            the emitter raises an error.
+        """
+        return self._sse_terminal
+
+    @sse_terminal.setter
+    def sse_terminal(self, value: SSEvent | bytes | None) -> None:
+        self._sse_terminal = value
 
     def set_stream(
         self,
