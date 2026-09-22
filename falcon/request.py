@@ -22,6 +22,7 @@ from io import BytesIO
 from typing import (
     Any,
     Callable,
+    cast,
     ClassVar,
     Literal,
     overload,
@@ -49,6 +50,7 @@ from falcon.stream import BoundedStream
 from falcon.typing import ReadableIO
 from falcon.util import deprecation
 from falcon.util import ETag
+from falcon.util import gzip as gzip_util
 from falcon.util import mediatypes
 from falcon.util import structures
 from falcon.util.uri import parse_host
@@ -92,6 +94,7 @@ class Request:
     __slots__ = (
         '__dict__',
         '_bounded_stream',
+        '_gzip_stream',
         '_cached_access_route',
         '_cached_forwarded',
         '_cached_forwarded_prefix',
@@ -110,7 +113,7 @@ class Request:
         'options',
         'path',
         'query_string',
-        'stream',
+        '_raw_stream',
         'uri_template',
         '_media',
         '_media_error',
@@ -188,55 +191,9 @@ class Request:
     """
     content_type: str | None
     """Value of the Content-Type header, or ``None`` if the header is missing."""
-    stream: ReadableIO
-    """File-like input object for reading the body of the
-    request, if any. This object provides direct access to the
-    server's data stream and is non-seekable. In order to
-    avoid unintended side effects, and to provide maximum
-    flexibility to the application, Falcon itself does not
-    buffer or spool the data in any way.
-
-    Since this object is provided by the WSGI
-    server itself, rather than by Falcon, it may behave
-    differently depending on how you host your app. For example,
-    attempting to read more bytes than are expected (as
-    determined by the Content-Length header) may or may not
-    block indefinitely. It's a good idea to test your WSGI
-    server to find out how it behaves.
-
-    This can be particularly problematic when a request body is
-    expected, but none is given. In this case, the following
-    call blocks under certain WSGI servers::
-
-        # Blocks if Content-Length is 0
-        data = req.stream.read()
-
-    The workaround is fairly straightforward, if verbose::
-
-        # If Content-Length happens to be 0, or the header is
-        # missing altogether, this will not block.
-        data = req.stream.read(req.content_length or 0)
-
-    Alternatively, when passing the stream directly to a
-    consumer, it may be necessary to branch off the
-    value of the Content-Length header::
-
-        if req.content_length:
-            doc = json.load(req.stream)
-
-    For a slight performance cost, you may instead wish to use
-    :attr:`bounded_stream`, which wraps the native WSGI
-    input object to normalize its behavior.
-
-    Note:
-        If an HTML form is POSTed to the API using the
-        *application/x-www-form-urlencoded* media type, and
-        the :attr:`~.RequestOptions.auto_parse_form_urlencoded`
-        option is set, the framework
-        will consume `stream` in order to parse the parameters
-        and merge them into the query string parameters. In this
-        case, the stream will be left at EOF.
-    """
+    _raw_stream: ReadableIO
+    """Native WSGI input stream, retained for requests without gzip."""
+    _gzip_stream: Any
     options: RequestOptions
     """Set of global options passed from the App handler."""
     is_websocket: bool
@@ -319,7 +276,8 @@ class Request:
         except KeyError:
             self.content_type = None
 
-        self.stream = env['wsgi.input']
+        self._raw_stream = env['wsgi.input']
+        self._gzip_stream: gzip_util.SyncGzipStream | None = None
         self._bounded_stream: BoundedStream | None = None  # Lazy wrapping
 
         # PERF(kgriffs): Technically, we should spend a few more
@@ -450,7 +408,35 @@ class Request:
         return value_as_int
 
     @property
-    def bounded_stream(self) -> BoundedStream:
+    def content_encoding(self) -> str | None:
+        """Value of the Content-Encoding header, or ``None`` if missing."""
+
+        try:
+            return self.env['HTTP_CONTENT_ENCODING'] or None
+        except KeyError:
+            return None
+
+    def _is_gzip_encoded(self) -> bool:
+        return gzip_util.is_gzip_content_encoding(self.content_encoding)
+
+    @property
+    def stream(self) -> ReadableIO:
+        """File-like input object for reading the request body.
+
+        This object provides direct access to the server's data stream and is
+        non-seekable. When supported gzip Content-Encoding is present, reads
+        transparently return decompressed bytes while
+        :attr:`content_length` still reports the compressed wire length.
+
+        Unlike :attr:`bounded_stream`, the native underlying stream is used
+        for unencoded requests and may block when reading beyond the request
+        body. Prefer :attr:`bounded_stream` unless direct access is needed.
+        """
+
+        return self.bounded_stream if self._is_gzip_encoded() else self._raw_stream
+
+    @property
+    def bounded_stream(self) -> BoundedStream | gzip_util.SyncGzipStream:
         """File-like wrapper around `stream` to normalize
         certain differences between the native input objects
         employed by different WSGI servers. In particular,
@@ -468,8 +454,20 @@ class Request:
 
             doc = json.load(req.bounded_stream)
         """  # noqa: D205
+        if self._gzip_stream is not None:
+            return cast(gzip_util.SyncGzipStream, self._gzip_stream)
+
         if self._bounded_stream is None:
             self._bounded_stream = self._get_wrapped_wsgi_input()
+
+        if self._is_gzip_encoded():
+            self._gzip_stream = gzip_util.SyncGzipStream(
+                self._bounded_stream,
+                self.options.max_gzip_decompressed_bytes or 2**63,
+                self.options.max_gzip_expansion_ratio,
+                self.content_length,
+            )
+            return cast(gzip_util.SyncGzipStream, self._gzip_stream)
 
         return self._bounded_stream
 
@@ -1141,7 +1139,9 @@ class Request:
 
         try:
             self._media = handler.deserialize(
-                self.bounded_stream, self.content_type, self.content_length
+                self.bounded_stream,
+                self.content_type,
+                None if self._gzip_stream else self.content_length,
             )
         except errors.MediaNotFoundError as err:
             self._media_error = err
@@ -1149,6 +1149,8 @@ class Request:
                 return default_when_empty
             raise
         except Exception as err:
+            if self._gzip_stream is not None:
+                self._gzip_stream.close()
             self._media_error = err
             raise
         finally:
@@ -2729,7 +2731,7 @@ class Request:
         if not content_length:
             return
 
-        body_bytes = self.stream.read(content_length)
+        body_bytes = self.bounded_stream.read()
 
         # NOTE(kgriffs): According to
         # https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#application%2Fx-www-form-urlencoded-encoding-algorithm
@@ -2876,6 +2878,8 @@ class RequestOptions:
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
+        '_max_gzip_decompressed_bytes',
+        '_max_gzip_expansion_ratio',
     )
 
     def __init__(self) -> None:
@@ -2885,3 +2889,41 @@ class RequestOptions:
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
+        self.max_gzip_decompressed_bytes = 64 * 1024 * 1024
+        self.max_gzip_expansion_ratio = 100
+
+    @property
+    def max_gzip_decompressed_bytes(self) -> int:
+        """Maximum number of decompressed bytes allowed in a gzip request body.
+
+        The limit is inclusive. Exceeding it raises
+        :class:`falcon.GzipExpansionLimitError` (HTTP ``413 Content Too Large``).
+        Defaults to 64 MiB. Set to ``0`` to disable the absolute limit.
+        """
+
+        return self._max_gzip_decompressed_bytes
+
+    @max_gzip_decompressed_bytes.setter
+    def max_gzip_decompressed_bytes(self, value: int) -> None:
+        if not isinstance(value, int) or value < 0:
+            raise ValueError('max_gzip_decompressed_bytes must be a non-negative int')
+
+        self._max_gzip_decompressed_bytes = value
+
+    @property
+    def max_gzip_expansion_ratio(self) -> float | int:
+        """Maximum ratio between decompressed bytes and the compressed body.
+
+        The limit is inclusive and checked incrementally. Exceeding it raises
+        :class:`falcon.GzipExpansionLimitError` (HTTP ``413 Content Too Large``).
+        Defaults to ``100`` (100:1). Set to ``0`` to disable the ratio limit.
+        """
+
+        return self._max_gzip_expansion_ratio
+
+    @max_gzip_expansion_ratio.setter
+    def max_gzip_expansion_ratio(self, value: float | int) -> None:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValueError('max_gzip_expansion_ratio must be a non-negative number')
+
+        self._max_gzip_expansion_ratio = value

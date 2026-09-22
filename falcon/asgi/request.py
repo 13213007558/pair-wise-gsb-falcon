@@ -41,6 +41,7 @@ from falcon.util import ETag
 from falcon.util.uri import parse_host
 from falcon.util.uri import parse_query_string
 
+from ..util import gzip as gzip_util
 from . import _request_helpers as asgi_helpers
 from .stream import BoundedStream
 
@@ -98,6 +99,7 @@ class Request(request.Request):
     _media: UnsetOr[Any] = _UNSET
     _media_error: Exception | None = None
     _stream: BoundedStream | None = None
+    _gzip_stream: Any | None = None
 
     scope: dict[str, Any]
     """Reference to the ASGI HTTP connection scope passed in
@@ -313,8 +315,12 @@ class Request(request.Request):
         return value_as_int
 
     @property
-    def stream(self) -> BoundedStream:  # type: ignore[override]
-        """File-like input object for reading the body of the request, if any."""
+    def stream(self) -> Any:
+        """File-like input object for reading the request body.
+
+        Supported gzip Content-Encoding is transparently decompressed, while
+        :attr:`content_length` remains the compressed wire length.
+        """
         if self.is_websocket:
             raise errors.UnsupportedError(
                 'ASGI does not support reading the WebSocket handshake request body.'
@@ -327,13 +333,35 @@ class Request(request.Request):
                 content_length=self.content_length,
             )
 
+        if gzip_util.is_gzip_content_encoding(self.content_encoding):
+            if self._gzip_stream is None:
+                self._gzip_stream = gzip_util.AsyncGzipStream(
+                    self._stream,
+                    self.options.max_gzip_decompressed_bytes or 2**63,
+                    self.options.max_gzip_expansion_ratio,
+                    self.content_length,
+                )
+
+            return self._gzip_stream
+
         return self._stream
+
+    @property
+    def content_encoding(self) -> str | None:
+        """Value of the Content-Encoding header, or ``None`` if missing."""
+
+        try:
+            return self._asgi_headers[b'content-encoding'].decode('latin1') or None
+        except KeyError:
+            return None
 
     # NOTE(kgriffs): This is provided as an alias in order to ease migration
     #   from WSGI, but is not documented since we do not want people using
     #   it in greenfield ASGI apps.
     @property
-    def bounded_stream(self) -> BoundedStream:  # type: ignore[override]
+    def bounded_stream(
+        self,
+    ) -> Any:
         """Alias to :attr:`~.stream`."""
         return self.stream
 
@@ -629,13 +657,17 @@ class Request(request.Request):
         handler, _, deserialize_sync = self.options.media_handlers._resolve(
             self.content_type, self.options.default_media_type
         )
+        stream = self.stream
+        media_content_length = (
+            None if self._gzip_stream is not None else self.content_length
+        )
 
         try:
             if deserialize_sync:
-                self._media = deserialize_sync(await self.stream.read())
+                self._media = deserialize_sync(await stream.read())
             else:
                 self._media = await handler.deserialize_async(
-                    self.stream, self.content_type, self.content_length
+                    stream, self.content_type, media_content_length
                 )
 
         except errors.MediaNotFoundError as err:
@@ -644,11 +676,13 @@ class Request(request.Request):
                 return default_when_empty
             raise
         except Exception as err:
+            if self._gzip_stream is not None:
+                self._gzip_stream.close()
             self._media_error = err
             raise
         finally:
             if handler.exhaust_stream:
-                await self.stream.exhaust()
+                await stream.exhaust()
 
         return self._media
 

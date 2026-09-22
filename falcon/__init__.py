@@ -104,6 +104,8 @@ __all__ = (
     # Error classes
     'CompatibilityError',
     'DelimiterError',
+    'GzipDecodingError',
+    'GzipExpansionLimitError',
     'HeaderNotSupported',
     'HTTPBadGateway',
     'HTTPBadRequest',
@@ -358,6 +360,8 @@ from falcon.constants import WEBDAV_METHODS
 from falcon.constants import WebSocketPayloadType
 from falcon.errors import CompatibilityError
 from falcon.errors import DelimiterError
+from falcon.errors import GzipDecodingError
+from falcon.errors import GzipExpansionLimitError
 from falcon.errors import HeaderNotSupported
 from falcon.errors import HTTPBadGateway
 from falcon.errors import HTTPBadRequest

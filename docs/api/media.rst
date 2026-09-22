@@ -80,6 +80,49 @@ do the heavy lifting for you.
     will only process request media the first time it is referenced. Subsequent
     interactions will use a cached object.
 
+Gzip Request Bodies
+~~~~~~~~~~~~~~~~~~~
+
+When a request includes ``Content-Encoding: gzip`` (or the historical
+``x-gzip`` alias), ``req.stream``, ``req.bounded_stream``, iteration,
+``readline()``, and :meth:`~falcon.Request.get_media()` /
+:meth:`~falcon.asgi.Request.get_media()` all expose the *decompressed*
+payload. The same implementation is used by the WSGI and ASGI flavors, and
+supports arbitrary network chunks as well as multiple concatenated gzip
+members.
+
+``req.content_length`` remains the length of the compressed body received on
+the wire. It is not used to truncate decompressed output. Because the
+decompressed length is unknown, media handlers receive ``None`` for the
+content-length argument while a gzip body is being decoded.
+
+Decompression is bounded by
+:attr:`falcon.RequestOptions.max_gzip_decompressed_bytes` (inclusive, default
+64 MiB) and :attr:`falcon.RequestOptions.max_gzip_expansion_ratio`
+(inclusive, default 100:1). Either limit may be disabled by setting it to
+``0``. Reaching a limit raises :class:`falcon.GzipExpansionLimitError`, which
+is rendered as ``413 Content Too Large``. Falcon stops requesting additional
+compressed bytes once the next decompressed byte proves that a limit has been
+exceeded.
+
+Invalid gzip magic, truncated members or trailers, incorrect CRC/length
+checks, and non-gzip trailing bytes raise
+:class:`falcon.GzipDecodingError`, rendered as ``400 Bad Request``. The body
+is only exposed after its complete gzip framing has been validated, so a
+corrupt or truncated stream can never be returned as complete media. An
+unsupported or chained encoding such as ``deflate``, ``br``, or ``gzip,
+gzip`` raises :class:`falcon.HTTPUnsupportedMediaType` (``415``).
+
+Successful media and media errors follow the normal ``get_media()`` caching
+semantics. Repeated calls return the cached object or re-raise the cached
+exception and do not consume the request stream again. When ASGI media
+processing fails, Falcon closes the decompressed stream and discards its
+prefetched buffer without issuing another ``receive()`` call. When ignoring a
+partially consumed request, applications should still explicitly close the
+ASGI stream (or exhaust it when validation is desired). On WSGI, the hosting
+server is responsible for closing or discarding the underlying connection at
+the end of the request.
+
 .. _media_validation:
 
 Validating Media

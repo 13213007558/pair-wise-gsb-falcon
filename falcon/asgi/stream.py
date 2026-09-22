@@ -38,6 +38,11 @@ class BoundedStream:
     the stream will yield data until the ASGI server indicates that no more
     bytes are available.
 
+    When the request uses supported gzip Content-Encoding, :class:`Request`
+    wraps this stream so that reads, iteration, and media handlers consume the
+    decompressed body while the Content-Length header still refers to the
+    compressed wire data.
+
     For large request bodies, the preferred method of using the stream object is
     as an asynchronous iterator. In this mode, each body chunk is simply yielded
     in its entirety, as it is received from the ASGI server. Because no data is

@@ -53,6 +53,8 @@ if TYPE_CHECKING:
 __all__ = (
     'CompatibilityError',
     'DelimiterError',
+    'GzipDecodingError',
+    'GzipExpansionLimitError',
     'HeaderNotSupported',
     'HTTPBadGateway',
     'HTTPBadRequest',
@@ -2681,6 +2683,33 @@ class MediaValidationError(HTTPBadRequest):
             title=title,
             description=description,
             headers=headers,
+            **kwargs,
+        )
+
+
+class GzipDecodingError(HTTPBadRequest):
+    """The gzip-encoded request body could not be decoded.
+
+    The compressed data is truncated, contains an invalid member or checksum,
+    or includes bytes after the final gzip member.
+    """
+
+    def __init__(self, *, description: str | None = None, **kwargs: Any) -> None:
+        super().__init__(
+            title='Invalid gzip encoding',
+            description=description or 'The request body is not valid gzip data.',
+            **kwargs,
+        )
+
+
+class GzipExpansionLimitError(HTTPContentTooLarge):
+    """The decompressed request body exceeds a configured gzip limit."""
+
+    def __init__(self, *, description: str | None = None, **kwargs: Any) -> None:
+        super().__init__(
+            title='Gzip payload too large',
+            description=description
+            or 'The decompressed request body exceeds the configured limit.',
             **kwargs,
         )
 

@@ -153,10 +153,16 @@ Predefined Errors
 .. autoclass:: falcon.HTTPContentTooLarge
     :members:
 
+.. autoclass:: falcon.GzipExpansionLimitError
+    :members:
+
 .. autoclass:: falcon.HTTPUriTooLong
     :members:
 
 .. autoclass:: falcon.HTTPUnsupportedMediaType
+    :members:
+
+.. autoclass:: falcon.GzipDecodingError
     :members:
 
 .. autoclass:: falcon.HTTPRangeNotSatisfiable
