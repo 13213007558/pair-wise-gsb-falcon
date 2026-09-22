@@ -520,7 +520,10 @@ class App(Generic[_ReqT, _RespT]):
             resp_status: str = code_to_http_status(resp.status)
             default_media_type: str | None = self.resp_options.default_media_type
 
-            if req.method == 'HEAD' or resp_status in _BODILESS_STATUS_CODES:
+            discard_body = req.method == 'HEAD' or resp_status in _BODILESS_STATUS_CODES
+            if discard_body:
+                if hasattr(resp.stream, 'close'):
+                    resp.stream.close()  # type: ignore[union-attr]
                 body = []
 
                 # PERF(vytas): move check for the less common and much faster path

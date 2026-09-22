@@ -656,7 +656,11 @@ class App(falcon.app.App[_ReqT, _RespT]):
             resp_status: int = resp.status_code
             default_media_type: str | None = self.resp_options.default_media_type
 
-            if req.method == 'HEAD' or resp_status in _BODILESS_STATUS_CODES:
+            discard_body = req.method == 'HEAD' or resp_status in _BODILESS_STATUS_CODES
+            if discard_body:
+                if hasattr(resp.stream, 'close'):
+                    await resp.stream.close()  # type: ignore[union-attr]
+
                 #
                 # PERF(vytas): move check for the less common and much faster path
                 # of resp_status being in {204, 304} here; NB: this builds on the

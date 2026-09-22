@@ -1,8 +1,10 @@
 import errno
+import gzip
 import io
 import os
 import pathlib
 import posixpath
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -11,6 +13,9 @@ import falcon
 from falcon.routing import StaticRoute
 from falcon.routing import StaticRouteAsync
 from falcon.routing.static import _BoundedFile
+from falcon.routing.static import _MultiRangeFile
+from falcon.routing.static import _parse_byte_ranges
+from falcon.routing.static import _set_range
 import falcon.testing as testing
 
 
@@ -52,7 +57,7 @@ def create_sr(asgi, prefix, directory, **kwargs):
 
 @pytest.fixture
 def patch_open(monkeypatch):
-    def patch(content=None, validate=None, mtime=1736617934):
+    def patch(content=None, validate=None, mtime=1736617934, file_cls=None):
         def open(path, mode):
             class FakeFD(int):
                 pass
@@ -66,7 +71,7 @@ def patch_open(monkeypatch):
                 validate(path)
 
             data = path.encode() if content is None else content
-            fake_file = io.BytesIO(data)
+            fake_file = (file_cls or io.BytesIO)(data)
             fd = FakeFD(1337)
             fd._stat = FakeStat(len(data))
             fake_file.fileno = lambda: fd
@@ -387,6 +392,13 @@ def test_pathlib_path(asgi, util, patch_open):
     assert body.decode() == normalize_path('/var/www/statics/css/test.css')
 
 
+async def test_async_static_route_rejects_websocket():
+    route = StaticRouteAsync('/static', normalize_path('/var/www/statics'))
+
+    with pytest.raises(falcon.HTTPBadRequest):
+        await route(object(), object(), ws=object())
+
+
 def test_lifo(client, patch_open):
     patch_open()
 
@@ -608,6 +620,89 @@ def test_bounded_file_wrapper():
     assert buffer.closed
 
 
+def test_parse_byte_ranges_overlapping_and_suffix():
+    assert _parse_byte_ranges('bytes=0-3, 2-4, 99-100', 16) == [(0, 4)]
+    with pytest.raises(falcon.HTTPRangeNotSatisfiable):
+        _parse_byte_ranges('bytes=99-', 16)
+    assert _parse_byte_ranges('bytes=-30', 16) == [(0, 15)]
+    assert _parse_byte_ranges('words=0-1', 16) is None
+    assert _parse_byte_ranges('bytes=0-1', 0) is None
+
+
+@pytest.mark.parametrize(
+    'range_header',
+    [
+        'bytes=',
+        'bytes= ',
+        'bytes=0-1,',
+        'bytes=-1, 1-2',
+        'bytes=-1-2',
+        'bytes=-0-1',
+        'bytes=-',
+        'bytes=-1-',
+    ],
+)
+def test_parse_byte_ranges_invalid(range_header):
+    with pytest.raises(falcon.HTTPInvalidHeader):
+        _parse_byte_ranges(range_header, 16)
+
+
+def test_set_range_boundaries():
+    st = SimpleNamespace(st_size=16)
+
+    empty_file = io.BytesIO(b'')
+    stream, length, content_range, multipart_type = _set_range(
+        empty_file, SimpleNamespace(st_size=0), (0, 0)
+    )
+    assert stream is empty_file
+    assert (length, content_range, multipart_type) == (0, None, None)
+
+    data_file = io.BytesIO(b'0123456789abcdef')
+    stream, length, content_range, multipart_type = _set_range(data_file, st, (8, -1))
+    assert stream.read() == b'89abcdef'
+    assert length == 8
+    assert content_range == (8, 15, 16)
+    assert multipart_type is None
+
+    data_file = io.BytesIO(b'0123456789abcdef')
+    stream, length, content_range, multipart_type = _set_range(data_file, st, (1, 3))
+    assert stream.read() == b'123'
+    assert length == 3
+    assert content_range == (1, 3, 16)
+    assert multipart_type is None
+
+    with pytest.raises(falcon.HTTPRangeNotSatisfiable):
+        _set_range(io.BytesIO(b'0123456789abcdef'), st, (16, -1))
+
+
+def test_multi_range_file_short_read_closes_file():
+    class EmptyFile:
+        closed = False
+
+        def seek(self, position):
+            pass
+
+        def read(self, size):
+            return b''
+
+        def close(self):
+            self.closed = True
+
+    empty_file = EmptyFile()
+    stream = _MultiRangeFile(
+        empty_file, [(0, 0)], 16, 'application/octet-stream', 'boundary'
+    )
+
+    stream.read(
+        len(b'--boundary\r\nContent-Type: application/octet-stream\r\n')
+        + len(b'Content-Range: bytes 0-0/16\r\n\r\n')
+    )
+    with pytest.raises(OSError):
+        stream.read(1)
+
+    assert empty_file.closed
+
+
 def test_file_closed(client, patch_open):
     patch_open(b'test_data')
 
@@ -757,3 +852,296 @@ def test_if_none_match_precedence(client, patch_open):
     )
     assert resp2.status == falcon.HTTP_304
     assert resp2.text == ''
+
+
+MTIME = 1736617934.133701
+HTTP_DATE = 'Sat, 11 Jan 2025 17:52:14 GMT'
+CONTENT = b'0123456789abcdef'
+COMPRESSED_CONTENT = gzip.compress(CONTENT, compresslevel=9, mtime=0)
+STRONG_ETAG = f'"6782afce-{len(COMPRESSED_CONTENT):x}"'
+WEAK_ETAG = f'W/"6782afce-{len(COMPRESSED_CONTENT):x}"'
+
+
+class CompressionMiddleware:
+    def process_response(self, req, resp, resource, req_succeeded):
+        resp.append_header('Vary', 'Accept-Encoding')
+        if req_succeeded and resp.status_code in (200, 206):
+            resp.set_header('Content-Encoding', 'gzip')
+
+    async def process_response_async(self, req, resp, resource, req_succeeded):
+        self.process_response(req, resp, resource, req_succeeded)
+
+
+def _compressed_client(asgi, util, patch_open):
+    patch_open(content=COMPRESSED_CONTENT, mtime=MTIME)
+    app = util.create_app(asgi=asgi, middleware=[CompressionMiddleware()])
+    app.add_static_route('/downloads', '/opt/somesite/downloads')
+    client = testing.TestClient(app)
+    client.asgi = asgi
+    return client
+
+
+@pytest.mark.parametrize(
+    'method, headers, expected_status, expected_body',
+    [
+        (
+            'GET',
+            {
+                'If-None-Match': WEAK_ETAG,
+                'If-Modified-Since': 'Sat, 11 Jan 2025 17:52:13 GMT',
+                'Range': 'bytes=1-3',
+            },
+            falcon.HTTP_304,
+            b'',
+        ),
+        (
+            'GET',
+            {
+                'If-Modified-Since': HTTP_DATE,
+                'Range': 'bytes=1-3',
+            },
+            falcon.HTTP_304,
+            b'',
+        ),
+        (
+            'GET',
+            {'If-Range': WEAK_ETAG, 'Range': 'bytes=1-3'},
+            falcon.HTTP_200,
+            COMPRESSED_CONTENT,
+        ),
+        (
+            'GET',
+            {'If-Range': STRONG_ETAG, 'Range': 'bytes=1-3'},
+            falcon.HTTP_206,
+            COMPRESSED_CONTENT[1:4],
+        ),
+        (
+            'GET',
+            {
+                'If-Range': 'Sat, 11 Jan 2025 17:52:13 GMT',
+                'Range': 'bytes=1-3',
+            },
+            falcon.HTTP_200,
+            COMPRESSED_CONTENT,
+        ),
+        (
+            'GET',
+            {'If-Range': HTTP_DATE, 'Range': 'bytes=1-3'},
+            falcon.HTTP_206,
+            COMPRESSED_CONTENT[1:4],
+        ),
+        (
+            'GET',
+            {'If-Range': STRONG_ETAG, 'Range': 'bytes=-4'},
+            falcon.HTTP_206,
+            COMPRESSED_CONTENT[-4:],
+        ),
+        (
+            'HEAD',
+            {'If-Range': STRONG_ETAG, 'Range': 'bytes=1-3'},
+            falcon.HTTP_206,
+            b'',
+        ),
+        (
+            'HEAD',
+            {'If-Range': WEAK_ETAG, 'Range': 'bytes=1-3'},
+            falcon.HTTP_200,
+            b'',
+        ),
+    ],
+    ids=[
+        'weak-cache-hit-before-range',
+        'date-cache-hit-before-range',
+        'weak-if-range-falls-back',
+        'strong-etag-range',
+        'old-if-range-date-falls-back',
+        'if-range-date',
+        'suffix-range',
+        'head-range',
+        'head-if-range-fallback',
+    ],
+)
+def test_conditional_range_priority(
+    asgi, util, patch_open, method, headers, expected_status, expected_body
+):
+    client = _compressed_client(asgi, util, patch_open)
+
+    response = client.simulate_request(
+        method=method, path='/downloads/thing.zip', headers=headers
+    )
+
+    assert response.status == expected_status
+    assert response.content == expected_body
+    assert response.headers['ETag'] == STRONG_ETAG
+    assert response.headers['Last-Modified'] == HTTP_DATE
+    assert response.headers['Accept-Ranges'] == 'bytes'
+    assert response.headers['Vary'] == 'Accept-Encoding'
+    if expected_status == falcon.HTTP_304:
+        assert 'Content-Encoding' not in response.headers
+    else:
+        assert response.headers['Content-Encoding'] == 'gzip'
+    if expected_status == falcon.HTTP_206:
+        if headers['Range'] == 'bytes=-4':
+            start = len(COMPRESSED_CONTENT) - 4
+            end = len(COMPRESSED_CONTENT) - 1
+            assert response.headers['Content-Range'] == f'bytes {start}-{end}/36'
+            assert response.headers['Content-Length'] == '4'
+        else:
+            assert response.headers['Content-Range'] == (
+                f'bytes 1-3/{len(COMPRESSED_CONTENT)}'
+            )
+            assert response.headers['Content-Length'] == '3'
+    elif expected_status == falcon.HTTP_200:
+        assert response.headers['Content-Length'] == str(len(COMPRESSED_CONTENT))
+        assert 'Content-Range' not in response.headers
+    else:
+        assert 'Content-Length' not in response.headers
+
+
+def test_invalid_if_range_date(client, patch_open):
+    patch_open(content=COMPRESSED_CONTENT, mtime=MTIME)
+    client.app.add_static_route('/downloads', '/opt/somesite/downloads')
+
+    response = client.simulate_request(
+        path='/downloads/thing.zip',
+        headers={'If-Range': 'not-a-date', 'Range': 'bytes=1-3'},
+    )
+
+    assert response.status == falcon.HTTP_200
+    assert response.content == COMPRESSED_CONTENT
+
+
+def test_conditional_merged_ranges(asgi, util, patch_open):
+    patch_open(content=CONTENT, mtime=MTIME)
+    strong_etag = f'"6782afce-{len(CONTENT):x}"'
+    headers = {'If-Range': strong_etag, 'Range': 'bytes=1-3, 3-5, 10-11'}
+
+    def request():
+        route = create_sr(asgi, '/downloads', '/opt/somesite/downloads')
+        req = util.create_req(asgi, path='/downloads/thing.css', headers=headers)
+        resp = util.create_resp(asgi)
+        return route, req, resp
+
+    if asgi:
+
+        async def read_body(chunked=False):
+            route, req, resp = request()
+            await route(req, resp)
+            try:
+                if not chunked:
+                    return await resp.stream.read(), resp
+
+                chunks = []
+                while True:
+                    chunk = await resp.stream.read(3)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b''.join(chunks), resp
+            finally:
+                await resp.stream.close()
+
+        body, resp = falcon.async_to_sync(read_body)
+        chunked_body, _ = falcon.async_to_sync(read_body, True)
+    else:
+        route, req, resp = request()
+        route(req, resp)
+        body = resp.stream.read()
+        resp.stream.close()
+
+        route, req, resp = request()
+        route(req, resp)
+        chunks = []
+        while True:
+            chunk = resp.stream.read(3)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        chunked_body = b''.join(chunks)
+        resp.stream.close()
+
+    assert resp.status == falcon.HTTP_206
+    content_type = resp.content_type
+    boundary = content_type.split('boundary=', 1)[1]
+    expected = b''.join(
+        (
+            f'--{boundary}\r\n'.encode(),
+            b'Content-Type: text/css\r\n',
+            b'Content-Range: bytes 1-5/16\r\n\r\n',
+            b'12345',
+            f'\r\n--{boundary}\r\n'.encode(),
+            b'Content-Type: text/css\r\n',
+            b'Content-Range: bytes 10-11/16\r\n\r\n',
+            b'ab',
+            f'\r\n--{boundary}--\r\n'.encode(),
+        )
+    )
+    assert body == expected
+    assert chunked_body == expected
+    assert resp.content_length == str(len(expected))
+
+
+def test_conditional_range_not_satisfiable(client, patch_open):
+    patch_open(content=COMPRESSED_CONTENT, mtime=MTIME)
+    client.app.add_static_route('/downloads', '/opt/somesite/downloads')
+
+    response = client.simulate_request(
+        path='/downloads/thing.zip',
+        headers={
+            'If-Range': STRONG_ETAG,
+            'Range': f'bytes={len(COMPRESSED_CONTENT)}-',
+        },
+    )
+
+    assert response.status == falcon.HTTP_416
+    assert response.content
+    assert response.headers['Content-Range'] == f'bytes */{len(COMPRESSED_CONTENT)}'
+
+
+def test_head_closes_stream(client, patch_open):
+    patch_open(content=CONTENT, mtime=MTIME)
+    client.app.add_static_route('/downloads', '/opt/somesite/downloads')
+
+    response = client.simulate_head('/downloads/thing.zip')
+
+    assert response.status == falcon.HTTP_200
+    assert response.content == b''
+    assert response.headers['Content-Length'] == '16'
+    assert patch_open.current_file is not None
+    assert patch_open.current_file.closed
+
+
+def test_stream_read_error_closes_file(client, util, patch_open):
+    class FailingFile(io.BytesIO):
+        def read(self, size=-1):
+            raise OSError()
+
+    patch_open(content=CONTENT, mtime=MTIME, file_cls=FailingFile)
+    client.app.add_static_route('/downloads', '/opt/somesite/downloads')
+    strong_etag = f'"6782afce-{len(CONTENT):x}"'
+
+    if client.asgi:
+        route = create_sr(True, '/downloads', '/opt/somesite/downloads')
+        req = util.create_req(
+            True,
+            path='/downloads/thing.zip',
+            headers={'If-Range': strong_etag, 'Range': 'bytes=1-3'},
+        )
+        resp = falcon.asgi.Response()
+
+        async def run():
+            await route(req, resp)
+            with pytest.raises(OSError):
+                await resp.stream.read()
+            await resp.stream.close()
+
+        falcon.async_to_sync(run)
+    else:
+        with pytest.raises(OSError):
+            client.simulate_request(
+                path='/downloads/thing.zip',
+                headers={'If-Range': strong_etag, 'Range': 'bytes=1-3'},
+            )
+
+    assert patch_open.current_file is not None
+    assert patch_open.current_file.closed
