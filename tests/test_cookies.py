@@ -8,6 +8,7 @@ import warnings
 import pytest
 
 import falcon
+import falcon.asgi
 import falcon.testing as testing
 from falcon.util import http_date_to_dt
 from falcon.util.deprecation import DeprecatedWarning
@@ -207,7 +208,7 @@ def test_unset_cookies(client):
         result.cookies['barfoo'],
         path='/foo',
         domain='www.example.com',
-        same_site='none',
+        same_site='None',
     )
 
 
@@ -292,8 +293,8 @@ def test_cookies_setable():
     resp.set_cookie('foo', 'bar', max_age=300)
     resp.set_cookie('bar', 'baz', same_site='None', partitioned=True)
 
-    morsel1 = resp._cookies['foo']
-    morsel2 = resp._cookies['bar']
+    morsel1 = resp._cookies[('foo', '', '')]
+    morsel2 = resp._cookies[('bar', '', '')]
 
     assert isinstance(morsel1, http_cookies.Morsel)
     assert morsel1.key == 'foo'
@@ -512,7 +513,7 @@ def test_same_site_value_case_insensitive(same_site):
 
     # NOTE(kgriffs): Verify directly, unit-test style, since we
     #   already tested end-to-end above.
-    morsel = resp._cookies['foo']
+    morsel = resp._cookies[('foo', '', '')]
     assert morsel['samesite'].lower() == same_site.lower()
 
 
@@ -547,7 +548,7 @@ def test_unset_cookie_deprecation_warning():
         resp.unset_cookie('test', samesite='Strict')
 
     # Verify the cookie was still set correctly with the deprecated parameter
-    morsel = resp._cookies['test']
+    morsel = resp._cookies[('test', '', '')]
     assert morsel['samesite'] == 'Strict'
 
     # Test that using the new 'same_site' parameter doesn't raise a warning
@@ -556,7 +557,7 @@ def test_unset_cookie_deprecation_warning():
         resp.unset_cookie('test2', same_site='Lax')
 
     # Verify the cookie was set correctly with the new parameter
-    morsel2 = resp._cookies['test2']
+    morsel2 = resp._cookies[('test2', '', '')]
     assert morsel2['samesite'] == 'Lax'
 
     # Test that when both parameters are provided, deprecated one is used with warning
@@ -566,5 +567,373 @@ def test_unset_cookie_deprecation_warning():
         resp.unset_cookie('test3', samesite='None', same_site='Strict')
 
     # Verify the deprecated parameter value was used
-    morsel3 = resp._cookies['test3']
+    morsel3 = resp._cookies[('test3', '', '')]
     assert morsel3['samesite'] == 'None'
+
+
+# =====================================================================
+# Scoped storage, parsing, and WSGI/ASIG parity
+# =====================================================================
+
+
+def _parse_set_cookie_values(values):
+    """Parse Set-Cookie header values into a list of morsels.
+
+    Each header value is parsed individually so that multiple cookies
+    sharing the same name (but differing in scope) are preserved.
+    """
+    parsed = []
+    for value in values:
+        jar = http_cookies.SimpleCookie()
+        jar.load(value)
+        parsed.extend(jar.values())
+    return parsed
+
+
+def _response_set_cookie_values(resp, asgi):
+    if asgi:
+        headers = resp._asgi_headers()
+        return [v.decode('ascii') for n, v in headers if n == b'set-cookie']
+
+    return [v for n, v in resp._wsgi_headers() if n == 'set-cookie']
+
+
+def _response_set_cookie_morsels(resp, asgi):
+    return _parse_set_cookie_values(_response_set_cookie_values(resp, asgi))
+
+
+def _create_response(asgi):
+    return falcon.asgi.Response() if asgi else falcon.Response()
+
+
+def _morsel_scope(morsel):
+    return (morsel['domain'], morsel['path'])
+
+
+@pytest.mark.parametrize(
+    'first,second',
+    [
+        ({'path': '/a'}, {'path': '/b'}),
+        ({'path': '/'}, {'path': '/api'}),
+        ({'domain': 'example.com'}, {'domain': 'www.example.com'}),
+        ({'path': '/a', 'domain': 'example.com'}, {'path': '/a'}),
+        ({}, {'path': '/b', 'domain': 'example.com'}),
+    ],
+)
+def test_set_cookie_same_name_different_scope(asgi, first, second):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'one', secure=False, http_only=False, **first)
+    resp.set_cookie('x', 'two', secure=False, http_only=False, **second)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    assert len(morsels) == 2
+    by_scope = {_morsel_scope(morsel): morsel for morsel in morsels}
+    assert len(by_scope) == 2
+
+    first_scope = (first.get('domain', ''), first.get('path', ''))
+    second_scope = (second.get('domain', ''), second.get('path', ''))
+    assert by_scope[first_scope].value == 'one'
+    assert by_scope[second_scope].value == 'two'
+
+
+def test_set_cookie_same_scope_overwrites(asgi):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'one', path='/a', secure=False, http_only=False)
+    resp.set_cookie('x', 'two', path='/a', secure=False, http_only=False)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    assert len(morsels) == 1
+    assert morsels[0].value == 'two'
+    assert morsels[0]['path'] == '/a'
+
+
+def test_set_cookie_does_not_clobber_other_cookies(asgi):
+    resp = _create_response(asgi)
+    resp.set_cookie('a', '1', secure=False, http_only=False)
+    resp.set_cookie('b', '2', secure=False, http_only=False)
+    resp.set_cookie('c', '3', path='/sub', secure=False, http_only=False)
+    resp.set_cookie('a', 'replaced', secure=False, http_only=False)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    by_name = {morsel.key: morsel for morsel in morsels}
+    assert len(morsels) == 3
+    assert by_name['a'].value == 'replaced'
+    assert by_name['b'].value == '2'
+    assert by_name['c'].value == '3'
+    assert by_name['c']['path'] == '/sub'
+
+
+def test_unset_cookie_only_expires_matching_scope(asgi):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'one', path='/a', secure=False, http_only=False)
+    resp.set_cookie('x', 'two', path='/b', secure=False, http_only=False)
+    resp.unset_cookie('x', path='/a')
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    assert len(morsels) == 2
+    by_path = {morsel['path']: morsel for morsel in morsels}
+
+    expired = by_path['/a']
+    assert expired.value == ''
+    assert http_date_to_dt(expired['expires'], obs_date=True) < _utcnow()
+
+    kept = by_path['/b']
+    assert kept.value == 'two'
+    assert not kept['expires']
+
+
+def test_unset_cookie_replaces_set_cookie_in_same_scope(asgi):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'one', path='/a')
+    resp.unset_cookie('x', path='/a')
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    assert len(morsels) == 1
+    assert morsels[0].value == ''
+    assert http_date_to_dt(morsels[0]['expires'], obs_date=True) < _utcnow()
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        'a b',
+        'a,b',
+        'a;b',
+        'a"b',
+        'a=b',
+        '(paren)',
+        'slash/and\\back',
+        ' leading and trailing ',
+    ],
+)
+def test_set_cookie_quoted_value_roundtrip(asgi, value):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', value, secure=False, http_only=False)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    assert len(morsels) == 1
+    assert morsels[0].value == value
+
+
+@pytest.mark.parametrize(
+    'value', ['a\nb', 'a\rb', 'a\tb', 'a\x00b', 'a\x0bb', 'a\x7fb']
+)
+def test_set_cookie_value_control_characters_rejected(asgi, value):
+    resp = _create_response(asgi)
+
+    with pytest.raises(ValueError, match='control characters'):
+        resp.set_cookie('x', value)
+
+
+@pytest.mark.parametrize(
+    'name', ['a\nb', 'a\rb', 'a b', 'a;b', 'a,b', 'a=b', 'a(b', 'a"b']
+)
+def test_set_cookie_name_illegal_characters_rejected(asgi, name):
+    resp = _create_response(asgi)
+
+    with pytest.raises(KeyError):
+        resp.set_cookie(name, 'ok_value')
+
+
+@pytest.mark.parametrize('name', ['a\nb', 'a b', UNICODE_TEST_STRING])
+def test_unset_cookie_name_validation_matches_set_cookie(asgi, name):
+    resp = _create_response(asgi)
+
+    with pytest.raises(KeyError):
+        resp.unset_cookie(name)
+
+
+def test_same_site_none_requires_secure(asgi):
+    resp = _create_response(asgi)
+
+    with pytest.raises(ValueError, match='secure'):
+        resp.set_cookie('x', 'y', same_site='None', secure=False)
+
+    resp.set_cookie('x', 'y', same_site='None', secure=True)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+    assert len(morsels) == 1
+    assert morsels[0]['samesite'] == 'None'
+    assert morsels[0]['secure'] is True
+
+
+def test_same_site_none_requires_secure_globally_disabled(asgi):
+    resp = _create_response(asgi)
+    resp.options.secure_cookies_by_default = False
+
+    with pytest.raises(ValueError, match='secure'):
+        resp.set_cookie('x', 'y', same_site='None')
+
+    resp.set_cookie('x', 'y', same_site='None', secure=True)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+    assert len(morsels) == 1
+    assert morsels[0]['samesite'] == 'None'
+
+
+def test_partitioned_requires_secure(asgi):
+    resp = _create_response(asgi)
+
+    with pytest.raises(ValueError, match='secure'):
+        resp.set_cookie('x', 'y', partitioned=True, secure=False)
+
+    resp.set_cookie('x', 'y', partitioned=True, secure=True)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+    assert len(morsels) == 1
+    assert morsels[0]['partitioned'] is True
+    assert morsels[0]['secure'] is True
+
+
+@pytest.mark.parametrize(
+    'given,expected',
+    [
+        (0, '0'),
+        (-1, '-1'),
+        (1, '1'),
+        (15.9, '15'),
+        ('42', '42'),
+        (2**31, str(2**31)),
+    ],
+)
+def test_max_age_boundaries(asgi, given, expected):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'y', max_age=given, secure=False, http_only=False)
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+
+    assert len(morsels) == 1
+    assert morsels[0]['max-age'] == expected
+
+
+def test_max_age_not_set(asgi):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'y', secure=False, http_only=False)
+
+    (morsel,) = _response_set_cookie_morsels(resp, asgi)
+    assert morsel['max-age'] == ''
+
+
+@pytest.mark.parametrize(
+    'expires',
+    [
+        datetime(year=2050, month=1, day=1),
+        datetime(year=2050, month=1, day=1, tzinfo=timezone.utc),
+        datetime(
+            year=2050, month=1, day=1, tzinfo=timezone(timedelta(hours=5, minutes=30))
+        ),
+        datetime(year=2050, month=1, day=1, tzinfo=timezone(timedelta(hours=-8))),
+    ],
+    ids=['naive', 'utc', 'plus-5-30', 'minus-8'],
+)
+def test_expires_timezone_handling(asgi, expires):
+    resp = _create_response(asgi)
+    resp.set_cookie('x', 'y', expires=expires, secure=False, http_only=False)
+
+    (morsel,) = _response_set_cookie_morsels(resp, asgi)
+
+    if expires.tzinfo is None:
+        expected = expires.replace(tzinfo=timezone.utc)
+    else:
+        expected = expires.astimezone(timezone.utc)
+
+    parsed = http_date_to_dt(morsel['expires'], obs_date=True)
+    assert parsed == expected
+    assert morsel['expires'].endswith('GMT')
+
+
+@pytest.mark.parametrize(
+    'given,expected',
+    [
+        ('lax', 'Lax'),
+        ('LAX', 'Lax'),
+        ('strict', 'Strict'),
+        ('STRICT', 'Strict'),
+        ('none', 'None'),
+        ('None', 'None'),
+    ],
+)
+def test_unset_cookie_same_site_normalized(asgi, given, expected):
+    resp = _create_response(asgi)
+    resp.unset_cookie('x', same_site=given)
+
+    (morsel,) = _response_set_cookie_morsels(resp, asgi)
+    assert morsel['samesite'] == expected
+
+
+@pytest.mark.parametrize('same_site', ['bogus', 'laxx', 'stric'])
+def test_unset_cookie_invalid_same_site_rejected(asgi, same_site):
+    resp = _create_response(asgi)
+
+    with pytest.raises(ValueError, match='same_site'):
+        resp.unset_cookie('x', same_site=same_site)
+
+
+def test_unset_cookie_same_site_none_implies_secure(asgi):
+    resp = _create_response(asgi)
+    resp.unset_cookie('x', same_site='none')
+
+    (morsel,) = _response_set_cookie_morsels(resp, asgi)
+    assert morsel['samesite'] == 'None'
+    assert morsel['secure'] is True
+
+
+def test_unset_cookie_partitioned(asgi):
+    resp = _create_response(asgi)
+    resp.unset_cookie('x', partitioned=True)
+
+    (morsel,) = _response_set_cookie_morsels(resp, asgi)
+    assert morsel['partitioned'] is True
+    assert morsel['secure'] is True
+    assert morsel.value == ''
+    assert http_date_to_dt(morsel['expires'], obs_date=True) < _utcnow()
+
+
+def test_unset_cookie_secure_opt_in(asgi):
+    resp = _create_response(asgi)
+    resp.unset_cookie('x', secure=True)
+    resp.unset_cookie('y')
+
+    morsels = _response_set_cookie_morsels(resp, asgi)
+    by_name = {morsel.key: morsel for morsel in morsels}
+    assert by_name['x']['secure'] is True
+    assert by_name['y']['secure'] == ''
+
+
+def _morsel_signature(morsel):
+    attributes = {key: value for key, value in morsel.items() if key != 'expires'}
+    return (morsel.key, morsel.value, attributes)
+
+
+def test_wsgi_asgi_set_cookie_headers_match():
+    wsgi_resp = falcon.Response()
+    asgi_resp = falcon.asgi.Response()
+
+    for resp in (wsgi_resp, asgi_resp):
+        resp.set_cookie('scoped', 'one', path='/a')
+        resp.set_cookie('scoped', 'two', path='/b')
+        resp.set_cookie('quoted', 'two words', same_site='None', partitioned=True)
+        resp.set_cookie('plain', 'value', secure=False, http_only=False)
+        resp.unset_cookie('stale', path='/a')
+
+    wsgi_morsels = _response_set_cookie_morsels(wsgi_resp, asgi=False)
+    asgi_morsels = _response_set_cookie_morsels(asgi_resp, asgi=True)
+
+    assert len(wsgi_morsels) == 5
+    assert len(asgi_morsels) == 5
+
+    # NOTE: The expires attribute of the unset cookie is rendered as a
+    #   delta from the current time, so it is compared separately below.
+    wsgi_signatures = sorted(_morsel_signature(m) for m in wsgi_morsels)
+    asgi_signatures = sorted(_morsel_signature(m) for m in asgi_morsels)
+    assert wsgi_signatures == asgi_signatures
+
+    for morsels in (wsgi_morsels, asgi_morsels):
+        stale = next(m for m in morsels if m.key == 'stale')
+        assert http_date_to_dt(stale['expires'], obs_date=True) < _utcnow()

@@ -93,6 +93,16 @@ Simple example:
 
 You can of course also set the domain, path and lifetime of the cookie.
 
+.. note::
+
+    Cookies are scoped by their name, domain, and path. Calling
+    :meth:`~falcon.Response.set_cookie` again only replaces a
+    previously-set cookie when all three match; setting a cookie with
+    the same name but a different domain or path emits a separate
+    ``Set-Cookie`` header. Likewise,
+    :meth:`~falcon.Response.unset_cookie` only expires the cookie
+    whose name, domain, and path match the given values.
+
 .. code:: python
 
     # Set the maximum age of the cookie to 10 minutes (600 seconds)

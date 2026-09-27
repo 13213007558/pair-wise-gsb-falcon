@@ -62,6 +62,12 @@ if TYPE_CHECKING:
 _RESERVED_CROSSORIGIN_VALUES = frozenset({'anonymous', 'use-credentials'})
 _RESERVED_SAMESITE_VALUES = frozenset({'lax', 'strict', 'none'})
 
+# Control characters (0x00-0x1F and 0x7F) are disallowed in cookie values.
+#   This mirrors the check that http.cookies performs as of Python 3.13,
+#   applied here so that validation is consistent across all supported
+#   Python versions.
+_COOKIE_CONTROL_CHARS = frozenset(map(chr, range(0x20))) | {chr(0x7F)}
+
 
 class Response:
     """Represents an HTTP response to a client request.
@@ -88,7 +94,7 @@ class Response:
         '__dict__',
     )
 
-    _cookies: http_cookies.SimpleCookie | None
+    _cookies: dict[tuple[str, str, str], http_cookies.Morsel[str]] | None
     _data: bytes | None
     _extra_headers: list[tuple[str, str]] | None
     _headers: Headers
@@ -364,7 +370,15 @@ class Response:
 
         Note:
             This method can be called multiple times to add one or
-            more cookies to the response.
+            more cookies to the response. Cookies are scoped by their
+            name, domain, and path; setting a cookie only replaces a
+            previously-set cookie when all three match, so cookies
+            sharing a name but differing in domain or path are emitted
+            as separate Set-Cookie headers.
+
+            .. versionchanged:: 4.4
+                Cookies are now scoped by (name, domain, path) instead
+                of name only.
 
         See Also:
             To learn more about setting cookies, see
@@ -377,6 +391,8 @@ class Response:
                 values (e.g. multi-byte UTF-8 strings) raise ``KeyError``.
             value (str): Cookie value. As with ``name``, the value must be
                 US-ASCII encodable; non-ASCII values raise ``ValueError``.
+                Control characters (0x00-0x1F and 0x7F) are likewise
+                rejected with ``ValueError``.
                 Encode non-ASCII payloads (for example with
                 :func:`urllib.parse.quote` or :mod:`base64`) before
                 passing them to this method.
@@ -463,6 +479,10 @@ class Response:
                 Finally, when this attribute is not set on the cookie, the
                 attribute will be treated as if it had been set to ``'None'``.
 
+                Note:
+                    Setting `same_site` to ``'None'`` requires the cookie
+                    to also be secure; otherwise ``ValueError`` is raised.
+
                 (See also: `Same-Site RFC Draft`_)
 
             partitioned (bool): Prevents cookies from being accessed from other
@@ -472,6 +492,10 @@ class Response:
                 https://site-b.example. While this attribute is not yet
                 standardized, it is already used by Chrome.
 
+                Note:
+                    Partitioned cookies are required to also be secure;
+                    otherwise ``ValueError`` is raised.
+
                 (See also: `CHIPS`_)
 
                 .. versionadded:: 4.0
@@ -480,7 +504,9 @@ class Response:
             KeyError: `name` is not a valid cookie name (for example,
                 it contains non-ASCII characters).
             ValueError: `value` is not a valid cookie value (for example,
-                it contains non-ASCII characters).
+                it contains non-ASCII characters), or an invalid
+                combination of `secure`, `same_site`, and `partitioned`
+                was requested.
 
         .. _RFC 6265:
             http://tools.ietf.org/html/rfc6265
@@ -500,16 +526,10 @@ class Response:
 
         value = str(value)
 
-        if self._cookies is None:
-            self._cookies = http_cookies.SimpleCookie()
+        if _COOKIE_CONTROL_CHARS.intersection(value):
+            raise ValueError('value contains control characters')
 
-        try:
-            self._cookies[name] = value
-        except http_cookies.CookieError as e:  # pragma: no cover
-            # NOTE(tbug): we raise a KeyError here, to avoid leaking
-            # the CookieError to the user. SimpleCookie (well, BaseCookie)
-            # only throws CookieError on issues with the cookie key
-            raise KeyError(str(e))
+        morsel = self._get_scoped_morsel(name, value, domain, path)
 
         if expires:
             # set Expires on cookie. Format is Wdy, DD Mon YYYY HH:MM:SS GMT
@@ -520,34 +540,34 @@ class Response:
             fmt = '%a, %d %b %Y %H:%M:%S GMT'
             if expires.tzinfo is None:
                 # naive
-                self._cookies[name]['expires'] = expires.strftime(fmt)
+                morsel['expires'] = expires.strftime(fmt)
             else:
                 # aware
                 gmt_expires = expires.astimezone(timezone.utc)
-                self._cookies[name]['expires'] = gmt_expires.strftime(fmt)
+                morsel['expires'] = gmt_expires.strftime(fmt)
 
-        if max_age:
+        if max_age is not None:
             # RFC 6265 section 5.2.2 says about the max-age value:
             #   "If the remainder of attribute-value contains a non-DIGIT
             #    character, ignore the cookie-av."
             # That is, RFC-compliant response parsers will ignore the max-age
             # attribute if the value contains a dot, as in floating point
             # numbers. Therefore, attempt to convert the value to an integer.
-            self._cookies[name]['max-age'] = int(max_age)
+            morsel['max-age'] = int(max_age)
 
         if domain:
-            self._cookies[name]['domain'] = domain
+            morsel['domain'] = domain
 
         if path:
-            self._cookies[name]['path'] = path
+            morsel['path'] = path
 
         is_secure = self.options.secure_cookies_by_default if secure is None else secure
 
         if is_secure:
-            self._cookies[name]['secure'] = True
+            morsel['secure'] = True
 
         if http_only:
-            self._cookies[name]['httponly'] = http_only
+            morsel['httponly'] = http_only
 
         # PERF(kgriffs): Morsel.__setitem__() will lowercase this anyway,
         #   so we can just pass this in and when __setitem__() calls
@@ -560,10 +580,50 @@ class Response:
                     "same_site must be set to either 'lax', 'strict', or 'none'"
                 )
 
-            self._cookies[name]['samesite'] = same_site.capitalize()
+            if same_site == 'none' and not is_secure:
+                raise ValueError("same_site='none' requires the cookie to be secure")
+
+            morsel['samesite'] = same_site.capitalize()
 
         if partitioned:
-            self._cookies[name]['partitioned'] = True
+            if not is_secure:
+                raise ValueError('partitioned requires the cookie to be secure')
+
+            morsel['partitioned'] = True
+
+    def _get_scoped_morsel(
+        self, name: str, value: str, domain: str | None, path: str | None
+    ) -> http_cookies.Morsel[str]:
+        """Get or create the morsel for the given cookie scope.
+
+        Cookies are keyed by their name, domain, and path, so that
+        cookies sharing a name but differing in scope are emitted as
+        separate Set-Cookie headers instead of overwriting each
+        other. When a morsel already exists for the scope, its value
+        is updated in place, preserving any previously-set attributes.
+        """
+        if self._cookies is None:
+            self._cookies = {}
+
+        jar = http_cookies.SimpleCookie()
+        try:
+            jar[name] = value
+        except http_cookies.CookieError as ex:
+            # NOTE(tbug): we raise a KeyError here, to avoid leaking
+            # the CookieError to the user. SimpleCookie (well, BaseCookie)
+            # only throws CookieError on issues with the cookie key.
+            raise KeyError(str(ex))
+
+        fresh = jar[name]
+        scope = (name, domain or '', path or '')
+        morsel = self._cookies.get(scope)
+
+        if morsel is None:
+            self._cookies[scope] = fresh
+            return fresh
+
+        morsel.set(name, fresh.value, fresh.coded_value)
+        return morsel
 
     def unset_cookie(
         self,
@@ -572,6 +632,8 @@ class Response:
         path: str | None = None,
         same_site: str = 'Lax',
         samesite: str | None = None,
+        secure: bool = False,
+        partitioned: bool = False,
     ) -> None:
         """Unset a cookie in the response.
 
@@ -590,8 +652,14 @@ class Response:
             path and the domain must match the values that were
             used when the cookie was created.
 
+            .. versionchanged:: 4.4
+                The cookie to expire is now matched by (name, domain,
+                path), symmetrically with :meth:`set_cookie`.
+
         Args:
-            name (str): Cookie name
+            name (str): Cookie name. As with :meth:`set_cookie`, the name
+                must be US-ASCII encodable; non-ASCII values raise
+                ``KeyError``.
 
         Keyword Args:
             domain (str): Restricts the cookie to a specific domain and
@@ -630,20 +698,39 @@ class Response:
                     .. deprecated:: 4.1
                        Please use the ``same_site`` parameter instead.
 
+            secure (bool): Also emit the Secure attribute on the expired
+                cookie. This is implied when `partitioned` is enabled or
+                `same_site` is ``'None'``, since such cookies are only
+                valid together with Secure (default ``False``).
+
+                    .. versionadded:: 4.4
+
+            partitioned (bool): Expire a partitioned (CHIPS) cookie. The
+                expired cookie is emitted with the Partitioned attribute,
+                and Secure is implied (default ``False``).
+
+                    .. versionadded:: 4.4
+
+        Raises:
+            KeyError: `name` is not a valid cookie name (for example,
+                it contains non-ASCII characters).
+            ValueError: `same_site` is not one of ``'Lax'``,
+                ``'Strict'``, or ``'None'``.
+
         .. _Same-Site warnings:
             https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite#Fixing_common_warnings
         """  # noqa: E501
-        if self._cookies is None:
-            self._cookies = http_cookies.SimpleCookie()
+        if not _is_ascii_encodable(name):
+            raise KeyError('name is not ASCII encodable')
 
-        self._cookies[name] = ''
+        morsel = self._get_scoped_morsel(name, '', domain, path)
 
         # NOTE(Freezerburn): SimpleCookie apparently special cases the
         # expires attribute to automatically use strftime and set the
         # time as a delta from the current time. We use -1 here to
         # basically tell the browser to immediately expire the cookie,
         # thus removing it from future request objects.
-        self._cookies[name]['expires'] = -1
+        morsel['expires'] = -1
 
         # Handle deprecated samesite parameter
         if samesite is not None:
@@ -658,15 +745,40 @@ class Response:
         else:
             same_site_value = same_site
 
-        # NOTE(CaselIT): Set SameSite to Lax to avoid setting invalid cookies.
-        # See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite#Fixing_common_warnings  # noqa: E501
-        self._cookies[name]['samesite'] = same_site_value
+        if same_site_value:
+            same_site_value = same_site_value.lower()
+
+            if same_site_value not in _RESERVED_SAMESITE_VALUES:
+                raise ValueError(
+                    "same_site must be set to either 'lax', 'strict', or 'none'"
+                )
+
+            # NOTE(CaselIT): Set SameSite to Lax to avoid setting invalid
+            #   cookies. See
+            #   https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite#Fixing_common_warnings  # noqa: E501
+            morsel['samesite'] = same_site_value.capitalize()
+
+            if same_site_value == 'none':
+                # SameSite=None cookies are only valid together with Secure.
+                secure = True
+        else:
+            morsel['samesite'] = ''
+
+        if partitioned:
+            # CHIPS requires Partitioned cookies to also be Secure.
+            secure = True
+
+        if secure:
+            morsel['secure'] = True
+
+        if partitioned:
+            morsel['partitioned'] = True
 
         if domain:
-            self._cookies[name]['domain'] = domain
+            morsel['domain'] = domain
 
         if path:
-            self._cookies[name]['path'] = path
+            morsel['path'] = path
 
     @overload
     def get_header(self, name: str, default: str) -> str: ...
