@@ -115,6 +115,16 @@ You can also instruct the client to remove a cookie with the
     #   to expire its own copy of the cookie (if any).
     resp.unset_cookie('my_cookie')
 
+.. note::
+
+    For the deletion to succeed, the ``domain`` and ``path`` of the unset
+    cookie must match the values used when the cookie was created. If the
+    cookie was created with the ``Partitioned`` attribute, pass
+    ``partitioned=True`` to :meth:`~falcon.Response.unset_cookie` as well.
+    The unset cookie also carries the
+    :ref:`Secure <cookie-secure-attribute>` attribute by default, mirroring
+    :meth:`~falcon.Response.set_cookie`.
+
 .. _cookie-secure-attribute:
 
 The Secure Attribute
@@ -155,6 +165,11 @@ at least set this attribute to ``'Lax'`` in order to mitigate
 Currently, :meth:`~falcon.Response.set_cookie` does not set `SameSite` by
 default, although this may change in a future release.
 
+Note that per RFC 6265bis, ``SameSite=None`` is only valid in combination
+with the :ref:`Secure <cookie-secure-attribute>` attribute. Falcon enforces
+this requirement by raising a ``ValueError`` when ``same_site='None'`` is
+requested for a cookie that is not secure.
+
 .. _RFC 6265, Section 4.1.2.5:
     https://tools.ietf.org/html/rfc6265#section-4.1.2.5
 
@@ -170,8 +185,9 @@ Starting from Q1 2024, Google Chrome started to
 <https://developers.google.com/privacy-sandbox/3pcd/prepare/prepare-for-phaseout>`__.
 If your site is relying on cross-site cookies, it might be necessary to set the
 ``Partitioned`` attribute. ``Partitioned`` usually requires the
-:ref:`Secure <cookie-secure-attribute>` attribute to be set. While this is not
-enforced by Falcon, the framework does set ``Secure`` by default, unless
+:ref:`Secure <cookie-secure-attribute>` attribute to be set. Falcon enforces
+this requirement by raising a ``ValueError`` when a partitioned cookie
+is not secure. The framework also sets ``Secure`` by default, unless
 specified otherwise
 (see also :attr:`~falcon.ResponseOptions.secure_cookies_by_default`).
 

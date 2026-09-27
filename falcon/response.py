@@ -62,6 +62,32 @@ if TYPE_CHECKING:
 _RESERVED_CROSSORIGIN_VALUES = frozenset({'anonymous', 'use-credentials'})
 _RESERVED_SAMESITE_VALUES = frozenset({'lax', 'strict', 'none'})
 
+# Control characters (C0 controls and DEL) are not allowed anywhere in
+#   a Set-Cookie header per RFC 6265; emitting them could also enable
+#   response splitting attacks.
+_COOKIE_STRING_FORBIDDEN_CHARS = frozenset(map(chr, range(0x20))) | {chr(0x7F)}
+
+
+def _is_valid_cookie_string(value: str) -> bool:
+    """Check that a cookie string contains no control characters."""
+    return not _COOKIE_STRING_FORBIDDEN_CHARS.intersection(value)
+
+
+def _validate_cookie_attribute(value: str | None, name: str) -> None:
+    """Validate a cookie attribute value such as domain or path.
+
+    Raises:
+        ValueError: The value is not ASCII encodable, or it contains
+            control characters.
+    """
+    if value is None:
+        return
+
+    if not _is_ascii_encodable(value):
+        raise ValueError(name + ' is not ASCII encodable')
+    if not _is_valid_cookie_string(value):
+        raise ValueError(name + ' contains control characters')
+
 
 class Response:
     """Represents an HTTP response to a client request.
@@ -463,6 +489,12 @@ class Response:
                 Finally, when this attribute is not set on the cookie, the
                 attribute will be treated as if it had been set to ``'None'``.
 
+                Note:
+                    Per RFC 6265bis, ``'None'`` is only accepted when the
+                    cookie is also secure; otherwise a ``ValueError`` is
+                    raised. The value is normalized to canonical casing
+                    (``'Lax'``, ``'Strict'``, or ``'None'``).
+
                 (See also: `Same-Site RFC Draft`_)
 
             partitioned (bool): Prevents cookies from being accessed from other
@@ -472,15 +504,22 @@ class Response:
                 https://site-b.example. While this attribute is not yet
                 standardized, it is already used by Chrome.
 
+                Note:
+                    The ``Partitioned`` attribute requires the cookie to
+                    also be secure; otherwise a ``ValueError`` is raised.
+
                 (See also: `CHIPS`_)
 
                 .. versionadded:: 4.0
 
         Raises:
             KeyError: `name` is not a valid cookie name (for example,
-                it contains non-ASCII characters).
-            ValueError: `value` is not a valid cookie value (for example,
-                it contains non-ASCII characters).
+                it contains non-ASCII or other illegal characters).
+            ValueError: One of the cookie values is invalid. This includes
+                a `value`, `domain`, or `path` that contains non-ASCII
+                or control characters, an unsupported `same_site` value,
+                as well as setting `same_site` to 'None' or enabling
+                `partitioned` for a cookie that is not secure.
 
         .. _RFC 6265:
             http://tools.ietf.org/html/rfc6265
@@ -500,16 +539,42 @@ class Response:
 
         value = str(value)
 
+        if not _is_valid_cookie_string(value):
+            raise ValueError('value contains control characters')
+
+        _validate_cookie_attribute(domain, 'domain')
+        _validate_cookie_attribute(path, 'path')
+
+        if same_site:
+            same_site_normalized = same_site.lower()
+
+            if same_site_normalized not in _RESERVED_SAMESITE_VALUES:
+                raise ValueError(
+                    "same_site must be set to either 'lax', 'strict', or 'none'"
+                )
+        else:
+            same_site_normalized = None
+
+        is_secure = self.options.secure_cookies_by_default if secure is None else secure
+
+        if same_site_normalized == 'none' and not is_secure:
+            raise ValueError(
+                "same_site cannot be set to 'None' when the cookie is not secure"
+            )
+
+        if partitioned and not is_secure:
+            raise ValueError('partitioned requires the cookie to be secure')
+
         if self._cookies is None:
             self._cookies = http_cookies.SimpleCookie()
 
         try:
             self._cookies[name] = value
-        except http_cookies.CookieError as e:  # pragma: no cover
+        except http_cookies.CookieError as ex:
             # NOTE(tbug): we raise a KeyError here, to avoid leaking
             # the CookieError to the user. SimpleCookie (well, BaseCookie)
             # only throws CookieError on issues with the cookie key
-            raise KeyError(str(e))
+            raise KeyError(str(ex))
 
         if expires:
             # set Expires on cookie. Format is Wdy, DD Mon YYYY HH:MM:SS GMT
@@ -526,7 +591,7 @@ class Response:
                 gmt_expires = expires.astimezone(timezone.utc)
                 self._cookies[name]['expires'] = gmt_expires.strftime(fmt)
 
-        if max_age:
+        if max_age is not None:
             # RFC 6265 section 5.2.2 says about the max-age value:
             #   "If the remainder of attribute-value contains a non-DIGIT
             #    character, ignore the cookie-av."
@@ -541,26 +606,14 @@ class Response:
         if path:
             self._cookies[name]['path'] = path
 
-        is_secure = self.options.secure_cookies_by_default if secure is None else secure
-
         if is_secure:
             self._cookies[name]['secure'] = True
 
         if http_only:
             self._cookies[name]['httponly'] = http_only
 
-        # PERF(kgriffs): Morsel.__setitem__() will lowercase this anyway,
-        #   so we can just pass this in and when __setitem__() calls
-        #   lower() it will be very slightly faster.
-        if same_site:
-            same_site = same_site.lower()
-
-            if same_site not in _RESERVED_SAMESITE_VALUES:
-                raise ValueError(
-                    "same_site must be set to either 'lax', 'strict', or 'none'"
-                )
-
-            self._cookies[name]['samesite'] = same_site.capitalize()
+        if same_site_normalized:
+            self._cookies[name]['samesite'] = same_site_normalized.capitalize()
 
         if partitioned:
             self._cookies[name]['partitioned'] = True
@@ -572,6 +625,8 @@ class Response:
         path: str | None = None,
         same_site: str = 'Lax',
         samesite: str | None = None,
+        secure: bool | None = None,
+        partitioned: bool = False,
     ) -> None:
         """Unset a cookie in the response.
 
@@ -623,6 +678,12 @@ class Response:
             same_site (str): Allows to override the default 'Lax' same_site
                     setting for the unset cookie.
 
+                    Note:
+                        The value is normalized to canonical casing
+                        (``'Lax'``, ``'Strict'``, or ``'None'``), and
+                        ``'None'`` is only accepted when the unset cookie is
+                        also secure.
+
                     .. versionadded:: 4.1
 
             samesite (str): Deprecated. Use `same_site` instead.
@@ -630,20 +691,53 @@ class Response:
                     .. deprecated:: 4.1
                        Please use the ``same_site`` parameter instead.
 
+            secure (bool): Direct the client to only return the cookie
+                    in subsequent requests if they are made over HTTPS.
+                    Although this attribute is not required for the user
+                    agent to expire the cookie, it is emitted by default
+                    for symmetry with
+                    :meth:`~.Response.set_cookie`, and because modern
+                    browsers reject deletion cookies that combine
+                    ``SameSite=None`` or ``Partitioned`` with a missing
+                    ``Secure`` attribute.
+
+                    Note:
+                        The default value for this argument is normally
+                        ``True``, but can be modified by setting
+                        :attr:`~.ResponseOptions.secure_cookies_by_default`
+                        via :any:`App.resp_options`.
+
+                    .. versionadded:: 4.4
+
+            partitioned (bool): Also mark the unset cookie as
+                    ``Partitioned``. This is required in order to
+                    successfully remove a cookie that was originally
+                    created with the ``Partitioned`` attribute.
+
+                    Note:
+                        The ``Partitioned`` attribute requires the
+                        cookie to also be secure; otherwise a
+                        ``ValueError`` is raised.
+
+                    .. versionadded:: 4.4
+
+        Raises:
+            KeyError: `name` is not a valid cookie name (for example,
+                it contains non-ASCII or other illegal characters).
+            ValueError: One of the cookie values is invalid. This includes
+                a `domain` or `path` that contains non-ASCII or control
+                characters, an unsupported `same_site` value, as well as
+                setting `same_site` to 'None' or enabling `partitioned`
+                for a cookie that is not secure.
+
         .. _Same-Site warnings:
             https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite#Fixing_common_warnings
         """  # noqa: E501
-        if self._cookies is None:
-            self._cookies = http_cookies.SimpleCookie()
+        if not _is_ascii_encodable(name):
+            raise KeyError('name is not ASCII encodable')
 
-        self._cookies[name] = ''
-
-        # NOTE(Freezerburn): SimpleCookie apparently special cases the
-        # expires attribute to automatically use strftime and set the
-        # time as a delta from the current time. We use -1 here to
-        # basically tell the browser to immediately expire the cookie,
-        # thus removing it from future request objects.
-        self._cookies[name]['expires'] = -1
+        _validate_cookie_attribute(domain, 'domain')
+        _validate_cookie_attribute(path, 'path')
 
         # Handle deprecated samesite parameter
         if samesite is not None:
@@ -658,9 +752,55 @@ class Response:
         else:
             same_site_value = same_site
 
+        if same_site_value:
+            same_site_normalized = same_site_value.lower()
+
+            if same_site_normalized not in _RESERVED_SAMESITE_VALUES:
+                raise ValueError(
+                    "same_site must be set to either 'lax', 'strict', or 'none'"
+                )
+        else:
+            same_site_normalized = None
+
+        is_secure = self.options.secure_cookies_by_default if secure is None else secure
+
+        if same_site_normalized == 'none' and not is_secure:
+            raise ValueError(
+                "same_site cannot be set to 'None' when the cookie is not secure"
+            )
+
+        if partitioned and not is_secure:
+            raise ValueError('partitioned requires the cookie to be secure')
+
+        if self._cookies is None:
+            self._cookies = http_cookies.SimpleCookie()
+
+        try:
+            self._cookies[name] = ''
+        except http_cookies.CookieError as ex:
+            # NOTE(tbug): we raise a KeyError here, to avoid leaking
+            # the CookieError to the user. SimpleCookie (well, BaseCookie)
+            # only throws CookieError on issues with the cookie key
+            raise KeyError(str(ex))
+
+        # NOTE(Freezerburn): SimpleCookie apparently special cases the
+        # expires attribute to automatically use strftime and set the
+        # time as a delta from the current time. We use -1 here to
+        # basically tell the browser to immediately expire the cookie,
+        # thus removing it from future request objects.
+        self._cookies[name]['expires'] = -1
+
         # NOTE(CaselIT): Set SameSite to Lax to avoid setting invalid cookies.
         # See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite#Fixing_common_warnings  # noqa: E501
-        self._cookies[name]['samesite'] = same_site_value
+        self._cookies[name]['samesite'] = (
+            same_site_normalized.capitalize() if same_site_normalized else ''
+        )
+
+        if is_secure:
+            self._cookies[name]['secure'] = True
+
+        if partitioned:
+            self._cookies[name]['partitioned'] = True
 
         if domain:
             self._cookies[name]['domain'] = domain

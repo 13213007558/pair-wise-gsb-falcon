@@ -8,6 +8,7 @@ import warnings
 import pytest
 
 import falcon
+import falcon.asgi
 import falcon.testing as testing
 from falcon.util import http_date_to_dt
 from falcon.util.deprecation import DeprecatedWarning
@@ -207,7 +208,7 @@ def test_unset_cookies(client):
         result.cookies['barfoo'],
         path='/foo',
         domain='www.example.com',
-        same_site='none',
+        same_site='None',
     )
 
 
@@ -568,3 +569,425 @@ def test_unset_cookie_deprecation_warning():
     # Verify the deprecated parameter value was used
     morsel3 = resp._cookies['test3']
     assert morsel3['samesite'] == 'None'
+
+
+# =====================================================================
+# Response (header-level, parser-based)
+#
+# NOTE: The tests below parse the emitted Set-Cookie headers with
+#   http.cookies.SimpleCookie instead of matching substrings, so that
+#   quoting, attribute ordering, and encoding are all handled by a
+#   real parser.
+# =====================================================================
+
+
+def _parse_set_cookie_header(header_value):
+    """Parse a single Set-Cookie header value into exactly one morsel."""
+    jar = http_cookies.SimpleCookie()
+    jar.load(header_value)
+
+    morsels = list(jar.values())
+    assert len(morsels) == 1
+
+    return morsels[0]
+
+
+def _wsgi_set_cookie_headers(resp):
+    return [value for name, value in resp._wsgi_headers() if name == 'set-cookie']
+
+
+def _asgi_set_cookie_headers(resp):
+    return [
+        value.decode('ascii')
+        for name, value in resp._asgi_headers()
+        if name == b'set-cookie'
+    ]
+
+
+def _morsel_to_dict(morsel):
+    parsed = {'name': morsel.key, 'value': morsel.value}
+    for attr in (
+        'expires',
+        'path',
+        'domain',
+        'max-age',
+        'secure',
+        'httponly',
+        'samesite',
+        'partitioned',
+    ):
+        parsed[attr] = morsel[attr]
+
+    return parsed
+
+
+def test_multiple_set_cookie_calls_emit_one_header_per_name():
+    resp = falcon.Response()
+    resp.set_cookie('first', '1', path='/a')
+    resp.set_cookie('second', '2', path='/b')
+    resp.set_cookie('third', '3', http_only=False, secure=False)
+
+    headers = _wsgi_set_cookie_headers(resp)
+    assert len(headers) == 3
+
+    parsed = {m.key: m for m in map(_parse_set_cookie_header, headers)}
+    assert set(parsed) == {'first', 'second', 'third'}
+    assert parsed['first'].value == '1'
+    assert parsed['first']['path'] == '/a'
+    assert parsed['second'].value == '2'
+    assert parsed['second']['path'] == '/b'
+    assert parsed['third'].value == '3'
+    assert not parsed['third']['httponly']
+    assert not parsed['third']['secure']
+
+
+@pytest.mark.parametrize(
+    'first_path,second_path,expected_path',
+    [
+        ('/a', '/b', '/b'),
+        (None, '/b', '/b'),
+        # NOTE: SimpleCookie stores a single morsel per name, so the
+        #   attributes from the first call are merged into (and may be
+        #   overridden by) the second call for the same name.
+        ('/a', None, '/a'),
+        ('/same', '/same', '/same'),
+    ],
+)
+def test_set_cookie_same_name_different_paths(first_path, second_path, expected_path):
+    resp = falcon.Response()
+    resp.set_cookie('foo', 'first', path=first_path)
+    resp.set_cookie('other', 'untouched')
+    resp.set_cookie('foo', 'second', path=second_path)
+
+    parsed = list(map(_parse_set_cookie_header, _wsgi_set_cookie_headers(resp)))
+
+    foo = [morsel for morsel in parsed if morsel.key == 'foo']
+    assert len(foo) == 1
+    assert foo[0].value == 'second'
+    assert foo[0]['path'] == expected_path
+
+    other = [morsel for morsel in parsed if morsel.key == 'other']
+    assert len(other) == 1
+    assert other[0].value == 'untouched'
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        'plain',
+        'with space',
+        'with,comma',
+        'with;semicolon',
+        '"already-quoted"',
+        'colon:value',
+        'equals=sign',
+        'percent%sign',
+    ],
+)
+def test_set_cookie_quoted_value_round_trip(value):
+    resp = falcon.Response()
+    resp.set_cookie('foo', value, secure=False, http_only=False)
+
+    (header,) = _wsgi_set_cookie_headers(resp)
+    morsel = _parse_set_cookie_header(header)
+
+    assert morsel.key == 'foo'
+    assert morsel.value == value
+
+
+@pytest.mark.parametrize(
+    'tzinfo',
+    [
+        None,
+        timezone.utc,
+        timezone(timedelta(hours=1)),
+        timezone(timedelta(hours=-5, minutes=-30)),
+        timezone(timedelta(hours=14)),
+    ],
+)
+def test_set_cookie_expires_timezone_normalized(tzinfo):
+    resp = falcon.Response()
+    expires = datetime(2050, 1, 1, 12, 30, tzinfo=tzinfo)
+    resp.set_cookie('foo', 'bar', expires=expires)
+
+    (header,) = _wsgi_set_cookie_headers(resp)
+    morsel = _parse_set_cookie_header(header)
+    parsed_expires = http_date_to_dt(morsel['expires'], obs_date=True)
+
+    if tzinfo is None:
+        # NOTE: Naive datetimes are assumed to already be in GMT.
+        expected = expires.replace(tzinfo=timezone.utc)
+    else:
+        expected = expires.astimezone(timezone.utc)
+
+    assert parsed_expires == expected
+
+
+@pytest.mark.parametrize(
+    'max_age,expected',
+    [
+        (0, '0'),
+        (-1, '-1'),
+        (1, '1'),
+        (300, '300'),
+        (2**31 - 1, str(2**31 - 1)),
+        (2**63 - 1, str(2**63 - 1)),
+        (15.9, '15'),
+        ('15', '15'),
+    ],
+)
+def test_set_cookie_max_age_boundaries(max_age, expected):
+    resp = falcon.Response()
+    resp.set_cookie('foo', 'bar', max_age=max_age)
+
+    (header,) = _wsgi_set_cookie_headers(resp)
+    morsel = _parse_set_cookie_header(header)
+
+    assert morsel['max-age'] == expected
+
+
+def test_set_cookie_max_age_absent_by_default():
+    resp = falcon.Response()
+    resp.set_cookie('foo', 'bar')
+
+    (header,) = _wsgi_set_cookie_headers(resp)
+    morsel = _parse_set_cookie_header(header)
+
+    assert morsel['max-age'] == ''
+
+
+@pytest.mark.parametrize('max_age', ['abc', '1.5.2'])
+def test_set_cookie_max_age_invalid(max_age):
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError):
+        resp.set_cookie('foo', 'bar', max_age=max_age)
+
+
+CONTROL_CHARS = ['\r', '\n', '\t', '\x00', '\x0b', '\x1f', '\x7f']
+
+
+@pytest.mark.parametrize('char', CONTROL_CHARS)
+@pytest.mark.parametrize('field', ['value', 'domain', 'path'])
+def test_set_cookie_control_characters_rejected(field, char):
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError, match='control characters'):
+        kwargs = {'value': 'ok', field: 'bad' + char + 'value'}
+        resp.set_cookie('foo', **kwargs)
+
+
+@pytest.mark.parametrize('char', CONTROL_CHARS + [';', ' ', '(', '=', ','])
+def test_set_cookie_name_illegal_characters_rejected(char):
+    resp = falcon.Response()
+
+    with pytest.raises(KeyError):
+        resp.set_cookie('bad' + char + 'name', 'ok')
+
+
+@pytest.mark.parametrize('char', CONTROL_CHARS + [';', ' ', '='])
+def test_unset_cookie_name_illegal_characters_rejected(char):
+    resp = falcon.Response()
+
+    with pytest.raises(KeyError):
+        resp.unset_cookie('bad' + char + 'name')
+
+
+@pytest.mark.parametrize('field', ['value', 'domain', 'path'])
+def test_set_cookie_non_ascii_rejected(field):
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError, match='ASCII'):
+        kwargs = {'value': 'ok', field: UNICODE_TEST_STRING}
+        resp.set_cookie('foo', **kwargs)
+
+
+def test_unset_cookie_non_ascii_name_rejected():
+    resp = falcon.Response()
+
+    with pytest.raises(KeyError):
+        resp.unset_cookie(UNICODE_TEST_STRING)
+
+
+@pytest.mark.parametrize('field', ['domain', 'path'])
+def test_unset_cookie_non_ascii_attribute_rejected(field):
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError, match='ASCII'):
+        resp.unset_cookie('foo', **{field: UNICODE_TEST_STRING})
+
+
+@pytest.mark.parametrize('secure', [True, False, None])
+@pytest.mark.parametrize('same_site', ['None', 'none', 'NONE', 'Lax', 'Strict', None])
+def test_set_cookie_same_site_none_requires_secure(secure, same_site):
+    resp = falcon.Response()
+    effective_secure = True if secure is None else secure
+
+    if same_site and same_site.lower() == 'none' and not effective_secure:
+        with pytest.raises(ValueError, match='secure'):
+            resp.set_cookie('foo', 'bar', secure=secure, same_site=same_site)
+    else:
+        resp.set_cookie('foo', 'bar', secure=secure, same_site=same_site)
+
+        morsel = resp._cookies['foo']
+        assert bool(morsel['secure']) == effective_secure
+        if same_site:
+            assert morsel['samesite'] == same_site.capitalize()
+        else:
+            assert morsel['samesite'] == ''
+
+
+def test_set_cookie_same_site_none_requires_secure_option_disabled():
+    options = falcon.ResponseOptions()
+    options.secure_cookies_by_default = False
+    resp = falcon.Response(options=options)
+
+    with pytest.raises(ValueError, match='secure'):
+        resp.set_cookie('foo', 'bar', same_site='None')
+
+    resp.set_cookie('foo', 'bar', same_site='None', secure=True)
+    assert resp._cookies['foo']['samesite'] == 'None'
+
+
+@pytest.mark.parametrize('secure', [True, False, None])
+@pytest.mark.parametrize('partitioned', [True, False])
+def test_set_cookie_partitioned_requires_secure(secure, partitioned):
+    resp = falcon.Response()
+    effective_secure = True if secure is None else secure
+
+    if partitioned and not effective_secure:
+        with pytest.raises(ValueError, match='secure'):
+            resp.set_cookie('foo', 'bar', secure=secure, partitioned=partitioned)
+    else:
+        resp.set_cookie('foo', 'bar', secure=secure, partitioned=partitioned)
+
+        morsel = resp._cookies['foo']
+        assert bool(morsel['secure']) == effective_secure
+        assert bool(morsel['partitioned']) == partitioned
+
+
+@pytest.mark.parametrize(
+    'same_site,expected',
+    [
+        ('lax', 'Lax'),
+        ('LAX', 'Lax'),
+        ('Strict', 'Strict'),
+        ('strict', 'Strict'),
+        ('none', 'None'),
+        ('NONE', 'None'),
+    ],
+)
+def test_unset_cookie_same_site_normalized(same_site, expected):
+    resp = falcon.Response()
+    resp.unset_cookie('foo', same_site=same_site)
+
+    assert resp._cookies['foo']['samesite'] == expected
+
+
+@pytest.mark.parametrize('same_site', ['bogus', 'laxx', 'stric'])
+def test_unset_cookie_invalid_same_site(same_site):
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError):
+        resp.unset_cookie('foo', same_site=same_site)
+
+
+def test_unset_cookie_deletion_attributes():
+    resp = falcon.Response()
+    resp.unset_cookie('foo', path='/bar', domain='example.com')
+
+    (header,) = _wsgi_set_cookie_headers(resp)
+    morsel = _parse_set_cookie_header(header)
+
+    assert morsel.key == 'foo'
+    assert morsel.value == ''
+    assert morsel['path'] == '/bar'
+    assert morsel['domain'] == 'example.com'
+    assert morsel['samesite'] == 'Lax'
+    assert morsel['secure'] is True
+    assert http_date_to_dt(morsel['expires'], obs_date=True) < _utcnow()
+
+
+def test_unset_cookie_secure_disabled():
+    resp = falcon.Response()
+    resp.unset_cookie('foo', secure=False)
+
+    assert not resp._cookies['foo']['secure']
+
+
+def test_unset_cookie_same_site_none_requires_secure():
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError, match='secure'):
+        resp.unset_cookie('foo', same_site='None', secure=False)
+
+    resp.unset_cookie('foo', same_site='None')
+    morsel = resp._cookies['foo']
+    assert morsel['samesite'] == 'None'
+    assert morsel['secure'] is True
+
+
+def test_unset_cookie_partitioned_requires_secure():
+    resp = falcon.Response()
+
+    with pytest.raises(ValueError, match='secure'):
+        resp.unset_cookie('foo', partitioned=True, secure=False)
+
+
+def test_unset_cookie_partitioned_round_trip():
+    resp = falcon.Response()
+    resp.set_cookie('foo', 'bar', partitioned=True, same_site='None')
+    resp.unset_cookie('foo', partitioned=True, same_site='None')
+
+    (header,) = _wsgi_set_cookie_headers(resp)
+    morsel = _parse_set_cookie_header(header)
+
+    assert morsel.value == ''
+    assert morsel['partitioned'] is True
+    assert morsel['secure'] is True
+    assert morsel['samesite'] == 'None'
+    assert http_date_to_dt(morsel['expires'], obs_date=True) < _utcnow()
+
+
+def _scenario_basic(resp):
+    resp.set_cookie('foo', 'bar', path='/', domain='example.com')
+
+
+def _scenario_full(resp):
+    resp.set_cookie('session', 'abc123', max_age=300, same_site='Strict')
+    resp.set_cookie('prefs', 'with space', secure=False, http_only=False)
+    resp.unset_cookie('legacy', path='/old')
+
+
+def _scenario_partitioned(resp):
+    resp.set_cookie('chips', 'xyz', partitioned=True, same_site='None')
+    resp.unset_cookie('old-chips', partitioned=True)
+
+
+@pytest.mark.parametrize(
+    'scenario', [_scenario_basic, _scenario_full, _scenario_partitioned]
+)
+def test_wsgi_asgi_set_cookie_headers_match(scenario):
+    wsgi_resp = falcon.Response()
+    asgi_resp = falcon.asgi.Response()
+    scenario(wsgi_resp)
+    scenario(asgi_resp)
+
+    wsgi_headers = _wsgi_set_cookie_headers(wsgi_resp)
+    asgi_headers = _asgi_set_cookie_headers(asgi_resp)
+
+    assert len(wsgi_headers) == len(asgi_headers) > 0
+
+    wsgi_parsed = [_morsel_to_dict(_parse_set_cookie_header(h)) for h in wsgi_headers]
+    asgi_parsed = [_morsel_to_dict(_parse_set_cookie_header(h)) for h in asgi_headers]
+
+    for parsed in (wsgi_parsed, asgi_parsed):
+        for cookie in parsed:
+            raw_expires = cookie.pop('expires')
+            if raw_expires:
+                # NOTE: The exact second may differ between the two
+                #   responses, so only the deletion semantics (an
+                #   expiration date in the past) are checked here.
+                assert http_date_to_dt(raw_expires, obs_date=True) < _utcnow()
+
+    assert wsgi_parsed == asgi_parsed
