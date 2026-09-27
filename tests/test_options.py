@@ -12,6 +12,8 @@ class TestRequestOptions:
         assert not options.auto_parse_form_urlencoded
         assert not options.auto_parse_qs_csv
         assert not options.strip_url_path_trailing_slash
+        assert options.trusted_hops is None
+        assert options.max_forwarded_size is None
 
     @pytest.mark.parametrize(
         'option_name',
@@ -43,3 +45,22 @@ class TestRequestOptions:
 
         with pytest.raises(AttributeError):
             _assign_invalid()
+
+    @pytest.mark.parametrize('option_name', ['trusted_hops', 'max_forwarded_size'])
+    @pytest.mark.parametrize('value', [0, 1, 8192])
+    def test_valid_numeric_options(self, option_name, value):
+        options = RequestOptions()
+
+        setattr(options, option_name, value)
+        assert getattr(options, option_name) == value
+
+        setattr(options, option_name, None)
+        assert getattr(options, option_name) is None
+
+    @pytest.mark.parametrize('option_name', ['trusted_hops', 'max_forwarded_size'])
+    @pytest.mark.parametrize('value', [-1, -8192, '1', 1.5])
+    def test_invalid_numeric_options(self, option_name, value):
+        options = RequestOptions()
+
+        with pytest.raises(ValueError):
+            setattr(options, option_name, value)

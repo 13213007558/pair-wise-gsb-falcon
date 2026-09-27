@@ -35,6 +35,7 @@ from falcon._typing import StoreArg
 from falcon._typing import UnsetOr
 from falcon.asgi_spec import AsgiEvent
 from falcon.constants import SINGLETON_HEADERS
+from falcon.forwarded import _trusted_chain_suffix
 from falcon.forwarded import Forwarded
 from falcon.util import deprecation
 from falcon.util import ETag
@@ -397,8 +398,13 @@ class Request(request.Request):
         if b'forwarded' in self._asgi_headers:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on own scheme
-                scheme = forwarded[0].scheme or self.scheme
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    # Use first hop, fall back on own scheme
+                    scheme = forwarded[0].scheme or self.scheme
+                else:
+                    chain = _trusted_chain_suffix(forwarded, trusted_hops)
+                    scheme = (chain[0].scheme if chain else None) or self.scheme
             else:
                 scheme = self.scheme
         else:
@@ -412,6 +418,12 @@ class Request(request.Request):
                 )
             except KeyError:
                 scheme = self.scheme
+            else:
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is not None:
+                    items = [item.strip() for item in scheme.split(',') if item.strip()]
+                    chain = _trusted_chain_suffix(items, trusted_hops)
+                    scheme = chain[0] if chain else self.scheme
 
         return scheme
 
@@ -443,8 +455,13 @@ class Request(request.Request):
         if b'forwarded' in self._asgi_headers:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on self
-                host = forwarded[0].host or self.netloc
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    # Use first hop, fall back on self
+                    host = forwarded[0].host or self.netloc
+                else:
+                    chain = _trusted_chain_suffix(forwarded, trusted_hops)
+                    host = (chain[0].host if chain else None) or self.netloc
             else:
                 host = self.netloc
         else:
@@ -456,6 +473,12 @@ class Request(request.Request):
                 host = self._asgi_headers[b'x-forwarded-host'].decode('latin1')
             except KeyError:
                 host = self.netloc
+            else:
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is not None:
+                    items = [item.strip() for item in host.split(',') if item.strip()]
+                    chain = _trusted_chain_suffix(items, trusted_hops)
+                    host = chain[0] if chain else self.netloc
 
         return host
 
@@ -489,6 +512,14 @@ class Request(request.Request):
             property with caution and validate all values before
             using them. Do not rely on the access route to authorize
             requests!
+
+        Note:
+            When :attr:`~.RequestOptions.trusted_hops` is configured,
+            only the trusted hops (counting from the rightmost, closest
+            to the app, element of the chain) are included, since any
+            elements further to the left may have been forged by the
+            client. Empty elements are skipped and never counted as
+            hops.
         """  # noqa: D205
         if self._cached_access_route is None:
             # PERF(kgriffs): 'client' is optional according to the ASGI spec
@@ -517,13 +548,29 @@ class Request(request.Request):
 
             if b'forwarded' in headers:
                 self._cached_access_route = []
-                for hop in self.forwarded or ():
+                forwarded = self.forwarded
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    hops = forwarded or ()
+                else:
+                    hops = _trusted_chain_suffix(forwarded or [], trusted_hops)
+
+                for hop in hops:
                     if hop.src is not None:
                         host, __ = parse_host(hop.src)
                         self._cached_access_route.append(host)
             elif b'x-forwarded-for' in headers:
                 addresses = headers[b'x-forwarded-for'].decode('latin1').split(',')
-                self._cached_access_route = [ip.strip() for ip in addresses]
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    self._cached_access_route = [ip.strip() for ip in addresses]
+                else:
+                    # NOTE: Empty elements are dropped so that they can
+                    #   never be counted as trusted hops.
+                    items = [ip.strip() for ip in addresses if ip.strip()]
+                    self._cached_access_route = _trusted_chain_suffix(
+                        items, trusted_hops
+                    )
             elif b'x-real-ip' in headers:
                 self._cached_access_route = [headers[b'x-real-ip'].decode('latin1')]
 

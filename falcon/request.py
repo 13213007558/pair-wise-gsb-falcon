@@ -42,6 +42,7 @@ from falcon.constants import FALSE_STRINGS
 from falcon.constants import MEDIA_JSON
 from falcon.constants import TRUE_STRINGS
 from falcon.forwarded import _parse_forwarded_header
+from falcon.forwarded import _trusted_chain_suffix
 from falcon.forwarded import Forwarded
 from falcon.media import Handlers
 from falcon.media.json import _DEFAULT_JSON_HANDLER
@@ -367,6 +368,13 @@ class Request:
         is missing. If the header value is malformed, Falcon will
         make a best effort to parse what it can.
 
+        Note:
+            When :attr:`~.RequestOptions.trusted_hops` is configured,
+            a malformed header is no longer parsed on a best-effort
+            basis; instead, the entire header is ignored and ``None``
+            is returned. Likewise, ``None`` is returned when the header
+            exceeds :attr:`~.RequestOptions.max_forwarded_size`.
+
         (See also: RFC 7239, Section 4)
         """  # noqa: D205
         # PERF(kgriffs): We could DRY up this memoization pattern using
@@ -380,7 +388,21 @@ class Request:
             if forwarded is None:
                 return None
 
-            self._cached_forwarded = _parse_forwarded_header(forwarded)
+            max_size = self.options.max_forwarded_size
+            if max_size is not None and len(forwarded) > max_size:
+                # NOTE: Fail closed on an oversized header rather than
+                #   parsing a potentially pathological value.
+                return None
+
+            # NOTE: When trusted hops are configured, parse strictly so
+            #   that a malformed header is ignored in its entirety instead
+            #   of being acted upon partially.
+            strict = self.options.trusted_hops is not None
+            parsed = _parse_forwarded_header(forwarded, strict=strict)
+            if parsed is None:
+                return None
+
+            self._cached_forwarded = parsed
 
         return self._cached_forwarded
 
@@ -694,6 +716,12 @@ class Request:
         "proto" parameter in the first hop, the value of
         :attr:`scheme` is returned instead.
 
+        Note:
+            When :attr:`~.RequestOptions.trusted_hops` is configured,
+            the scheme is instead taken from the trusted hop, counting
+            from the rightmost (closest to the app) element of the
+            chain, and untrusted elements are ignored.
+
         (See also: RFC 7239, Section 1)
         """
         # PERF(kgriffs): Since the Forwarded header is still relatively
@@ -704,8 +732,13 @@ class Request:
         if 'HTTP_FORWARDED' in self.env:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on own scheme
-                scheme = forwarded[0].scheme or self.scheme
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    # Use first hop, fall back on own scheme
+                    scheme = forwarded[0].scheme or self.scheme
+                else:
+                    chain = _trusted_chain_suffix(forwarded, trusted_hops)
+                    scheme = (chain[0].scheme if chain else None) or self.scheme
             else:
                 scheme = self.scheme
         else:
@@ -717,6 +750,12 @@ class Request:
                 scheme = self.env['HTTP_X_FORWARDED_PROTO'].lower()
             except KeyError:
                 scheme = self.env['wsgi.url_scheme']
+            else:
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is not None:
+                    items = [item.strip() for item in scheme.split(',') if item.strip()]
+                    chain = _trusted_chain_suffix(items, trusted_hops)
+                    scheme = chain[0] if chain else self.scheme
 
         return scheme
 
@@ -827,6 +866,12 @@ class Request:
         :attr:`host` is returned instead.
 
         Note:
+            When :attr:`~.RequestOptions.trusted_hops` is configured,
+            the host is instead taken from the trusted hop, counting
+            from the rightmost (closest to the app) element of the
+            chain, and untrusted elements are ignored.
+
+        Note:
             Reverse proxies are often configured to set the Host
             header directly to the one that was originally
             requested by the user agent; in that case, using
@@ -842,8 +887,13 @@ class Request:
         if 'HTTP_FORWARDED' in self.env:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on self
-                host = forwarded[0].host or self.netloc
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    # Use first hop, fall back on self
+                    host = forwarded[0].host or self.netloc
+                else:
+                    chain = _trusted_chain_suffix(forwarded, trusted_hops)
+                    host = (chain[0].host if chain else None) or self.netloc
             else:
                 host = self.netloc
         else:
@@ -855,6 +905,12 @@ class Request:
                 host = self.env['HTTP_X_FORWARDED_HOST']
             except KeyError:
                 host = self.netloc
+            else:
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is not None:
+                    items = [item.strip() for item in host.split(',') if item.strip()]
+                    chain = _trusted_chain_suffix(items, trusted_hops)
+                    host = chain[0] if chain else self.netloc
 
         return host
 
@@ -979,6 +1035,14 @@ class Request:
             property with caution and validate all values before
             using them. Do not rely on the access route to authorize
             requests.
+
+        Note:
+            When :attr:`~.RequestOptions.trusted_hops` is configured,
+            only the trusted hops (counting from the rightmost, closest
+            to the app, element of the chain) are included, since any
+            elements further to the left may have been forged by the
+            client. Empty elements are skipped and never counted as
+            hops.
         """  # noqa: D205
         if self._cached_access_route is None:
             # NOTE(kgriffs): Try different headers in order of
@@ -994,13 +1058,29 @@ class Request:
 
             if 'HTTP_FORWARDED' in self.env:
                 self._cached_access_route = []
-                for hop in self.forwarded or ():
+                forwarded = self.forwarded
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    hops = forwarded or ()
+                else:
+                    hops = _trusted_chain_suffix(forwarded or [], trusted_hops)
+
+                for hop in hops:
                     if hop.src is not None:
                         host, __ = parse_host(hop.src)
                         self._cached_access_route.append(host)
             elif 'HTTP_X_FORWARDED_FOR' in self.env:
                 addresses = self.env['HTTP_X_FORWARDED_FOR'].split(',')
-                self._cached_access_route = [ip.strip() for ip in addresses]
+                trusted_hops = self.options.trusted_hops
+                if trusted_hops is None:
+                    self._cached_access_route = [ip.strip() for ip in addresses]
+                else:
+                    # NOTE: Empty elements are dropped so that they can
+                    #   never be counted as trusted hops.
+                    items = [ip.strip() for ip in addresses if ip.strip()]
+                    self._cached_access_route = _trusted_chain_suffix(
+                        items, trusted_hops
+                    )
             elif 'HTTP_X_REAL_IP' in self.env:
                 self._cached_access_route = [self.env['HTTP_X_REAL_IP']]
 
@@ -2869,6 +2949,70 @@ class RequestOptions:
     ``application/x-www-form-urlencoded`` and ``multipart/form-data`` media types.
     """
 
+    @property
+    def trusted_hops(self) -> int | None:
+        """Number of trusted proxy hops in front of the app (default ``None``).
+
+        When ``None`` (the default), the historical behavior is preserved:
+        the leftmost element of the ``Forwarded`` chain is used to resolve
+        :attr:`~.Request.forwarded_scheme` and
+        :attr:`~.Request.forwarded_host`, and the full chain is included in
+        :attr:`~.Request.access_route`. This is only appropriate when the
+        app is not behind a reverse proxy, or when all proxy headers are
+        sanitized upstream.
+
+        When set to a positive integer ``N``, the rightmost ``N`` elements of
+        the ``Forwarded`` (or ``X-Forwarded-*``) chain are considered to have
+        been added by trusted proxies, and the client information is taken
+        from the ``N``-th element counting from the right. Any elements
+        further to the left may have been forged by the client, so they are
+        excluded from :attr:`~.Request.access_route` and never used to
+        determine the client address, scheme, or host. If the chain contains
+        fewer than ``N`` elements, the header is considered untrustworthy and
+        connection-level values (such as ``REMOTE_ADDR``) are used
+        instead.
+
+        In this mode, a malformed ``Forwarded`` header is also treated as
+        untrustworthy and ignored entirely, rather than being parsed on a
+        best-effort basis.
+
+        Setting this option to ``0`` disables the use of forwarded headers
+        altogether.
+
+        (See also: RFC 7239, Section 4)
+        """
+        return self._trusted_hops
+
+    @trusted_hops.setter
+    def trusted_hops(self, value: int | None) -> None:
+        if value is not None and (not isinstance(value, int) or value < 0):
+            raise ValueError('trusted_hops must be None or a non-negative int')
+
+        self._trusted_hops = value
+
+    @property
+    def max_forwarded_size(self) -> int | None:
+        """Maximum allowed size of the ``Forwarded`` header (default ``None``).
+
+        When set to a non-negative integer, a ``Forwarded`` header whose
+        value is longer than this number of characters is ignored, as if
+        the header were not present in the request. This can be used to
+        place an upper bound on the resources spent parsing untrusted
+        input, and to fail closed rather than acting on a truncated or
+        otherwise pathological header value.
+
+        When ``None`` (the default), no limit is enforced, preserving
+        the historical behavior.
+        """
+        return self._max_forwarded_size
+
+    @max_forwarded_size.setter
+    def max_forwarded_size(self, value: int | None) -> None:
+        if value is not None and (not isinstance(value, int) or value < 0):
+            raise ValueError('max_forwarded_size must be None or a non-negative int')
+
+        self._max_forwarded_size = value
+
     __slots__ = (
         'keep_blank_qs_values',
         '_auto_parse_form_urlencoded',
@@ -2876,6 +3020,8 @@ class RequestOptions:
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
+        '_trusted_hops',
+        '_max_forwarded_size',
     )
 
     def __init__(self) -> None:
@@ -2885,3 +3031,5 @@ class RequestOptions:
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
+        self._trusted_hops = None
+        self._max_forwarded_size = None

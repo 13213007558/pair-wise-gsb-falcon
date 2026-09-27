@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import string
+from typing import Any
 
 from falcon.util.uri import unquote_string
 
@@ -89,7 +90,9 @@ class Forwarded:
         self.scheme = None
 
 
-def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
+def _parse_forwarded_header(
+    forwarded: str, strict: bool = False
+) -> list[Forwarded] | None:
     """Parse the value of a Forwarded header.
 
     Makes an effort to parse Forwarded headers as specified by RFC 7239:
@@ -104,10 +107,16 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
 
     Arguments:
         forwarded (str): Value of a Forwarded header
+        strict (bool): When ``True``, do not attempt to recover from
+            malformed syntax; return ``None`` instead, so that the caller
+            can treat the entire header as untrustworthy rather than
+            acting on a partially-parsed value (default ``False``).
 
     Returns:
         list: Sequence of Forwarded instances, representing each forwarded-element
         in the header, in the same order as they appeared in the header.
+        When `strict` is ``True`` and the header value is malformed,
+        ``None`` is returned instead.
     """
 
     elements = []
@@ -120,45 +129,10 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
     while 0 <= pos < end:
         match = _FORWARDED_PAIR_RE.match(forwarded, pos)
 
-        if match is not None:  # got a valid forwarded-pair
-            if need_separator:
-                # bad syntax here, skip to next comma
-                pos = forwarded.find(',', pos)
-
-            else:
-                pos += len(match.group(0))
-                need_separator = True
-
-                name, value = match.groups()
-
-                # NOTE(kgriffs): According to RFC 7239, parameter
-                # names are case-insensitive.
-                name = name.lower()
-
-                if value[0] == '"':
-                    value = unquote_string(value)
-
-                # NOTE(kgriffs): If this is the first pair we've encountered
-                # for this forwarded-element, initialize a new object.
-                if not parsed_element:
-                    parsed_element = Forwarded()
-
-                if name == 'by':
-                    parsed_element.dest = value
-                elif name == 'for':
-                    parsed_element.src = value
-                elif name == 'host':
-                    parsed_element.host = value
-                elif name == 'proto':
-                    # NOTE(kgriffs): RFC 7239 only requires that
-                    # the "proto" value conform to the Host ABNF
-                    # described in RFC 7230. The Host ABNF, in turn,
-                    # does not require that the scheme be in any
-                    # particular case, so we normalize it here to be
-                    # consistent with the WSGI spec that *does*
-                    # require the value of 'wsgi.url_scheme' to be
-                    # either 'http' or 'https' (case-sensitive).
-                    parsed_element.scheme = value.lower()
+        if match is not None and not need_separator:  # got a valid forwarded-pair
+            pos += len(match.group(0))
+            need_separator = True
+            parsed_element = _parse_forwarded_pair(match, parsed_element)
 
         elif forwarded[pos] == ',':  # next forwarded-element
             need_separator = False
@@ -182,6 +156,9 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
 
         else:
             # bad syntax here, skip to next comma
+            if strict:
+                return None
+
             pos = forwarded.find(',', pos)
 
     # NOTE(kgriffs): Add the last forwarded-element, if any
@@ -189,3 +166,79 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
         elements.append(parsed_element)
 
     return elements
+
+
+def _parse_forwarded_pair(
+    match: re.Match[str], parsed_element: Forwarded | None
+) -> Forwarded:
+    """Parse a single forwarded-pair into the given forwarded-element.
+
+    Arguments:
+        match (re.Match): Match object for a valid forwarded-pair.
+        parsed_element (Forwarded): The forwarded-element under
+            construction, or ``None`` if this is the first pair
+            encountered for the current forwarded-element.
+
+    Returns:
+        Forwarded: The updated forwarded-element.
+    """
+    name, value = match.groups()
+
+    # NOTE(kgriffs): According to RFC 7239, parameter
+    # names are case-insensitive.
+    name = name.lower()
+
+    if value[0] == '"':
+        value = unquote_string(value)
+
+    # NOTE(kgriffs): If this is the first pair we've encountered
+    # for this forwarded-element, initialize a new object.
+    if not parsed_element:
+        parsed_element = Forwarded()
+
+    if name == 'by':
+        parsed_element.dest = value
+    elif name == 'for':
+        parsed_element.src = value
+    elif name == 'host':
+        parsed_element.host = value
+    elif name == 'proto':
+        # NOTE(kgriffs): RFC 7239 only requires that
+        # the "proto" value conform to the Host ABNF
+        # described in RFC 7230. The Host ABNF, in turn,
+        # does not require that the scheme be in any
+        # particular case, so we normalize it here to be
+        # consistent with the WSGI spec that *does*
+        # require the value of 'wsgi.url_scheme' to be
+        # either 'http' or 'https' (case-sensitive).
+        parsed_element.scheme = value.lower()
+
+    return parsed_element
+
+
+def _trusted_chain_suffix(items: list[Any], trusted_hops: int) -> list[Any]:
+    """Select the trusted suffix of a forwarded chain.
+
+    Elements of a forwarded chain (such as the elements of a ``Forwarded``
+    header, or the addresses in an ``X-Forwarded-For`` header) are appended
+    by each proxy in turn, so the rightmost elements were added by the
+    proxies closest to the application. When `trusted_hops` proxies are
+    trusted, only the rightmost `trusted_hops` elements can be relied upon;
+    anything further to the left may have been forged by the client.
+
+    Arguments:
+        items (list): Elements of the chain, in the order they appeared
+            in the header (leftmost first).
+        trusted_hops (int): Number of trusted proxy hops, counting from
+            the rightmost (closest to the app) element.
+
+    Returns:
+        list: The trusted suffix of `items`, i.e. its rightmost
+        `trusted_hops` elements. If the chain contains fewer elements
+        than `trusted_hops`, or `trusted_hops` is less than 1, an empty
+        list is returned, since in that case no element can be trusted.
+    """
+    if trusted_hops < 1 or len(items) < trusted_hops:
+        return []
+
+    return items[-trusted_hops:]
