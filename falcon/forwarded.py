@@ -18,10 +18,20 @@
 # limitations under the License.
 from __future__ import annotations
 
+import logging
 import re
 import string
 
 from falcon.util.uri import unquote_string
+
+_logger = logging.getLogger('falcon')
+
+# Maximum accepted size, in characters, of a Forwarded header field value.
+#   Values larger than this are rejected wholesale (see below) in order to
+#   bound the parsing cost of attacker-controlled input, and to avoid
+#   deriving client connection info from a value that a size-conscious
+#   upstream proxy may have truncated or refused to validate.
+_MAX_FORWARDED_HEADER_SIZE = 8192
 
 # '-' at the end to prevent interpretation as range in a char class
 _TCHAR = string.digits + string.ascii_letters + r"!#$%&'*+.^_`|~-"
@@ -102,6 +112,10 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
     - It does NOT validate 'host' contents (Host ABNF).
     - It does NOT validate 'proto' contents for valid URI scheme names.
 
+    If the header value exceeds a reasonable size, it is rejected
+    wholesale (fail-closed) and an empty list is returned, rather than
+    attempting to salvage potentially untrustworthy elements.
+
     Arguments:
         forwarded (str): Value of a Forwarded header
 
@@ -110,6 +124,22 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
         in the header, in the same order as they appeared in the header.
     """
 
+    if len(forwarded) > _MAX_FORWARDED_HEADER_SIZE:
+        # Fail closed: the raw value is untrusted input, so it is
+        #   deliberately not included in the log message.
+        _logger.warning(
+            'Ignoring an oversized Forwarded header value '
+            '(%d characters exceeds the limit of %d).',
+            len(forwarded),
+            _MAX_FORWARDED_HEADER_SIZE,
+        )
+        return []
+
+    return _parse_forwarded_elements(forwarded)
+
+
+def _parse_forwarded_elements(forwarded: str) -> list[Forwarded]:
+    """Parse forwarded-elements from a size-checked Forwarded header value."""
     elements = []
 
     pos = 0
@@ -189,3 +219,32 @@ def _parse_forwarded_header(forwarded: str) -> list[Forwarded]:
         elements.append(parsed_element)
 
     return elements
+
+
+def _trusted_hop_index(chain_length: int, trusted_proxies: int) -> int:
+    """Compute the index of the client info hop within a proxy chain.
+
+    A chain is ordered from the original client (leftmost) towards the
+    server, and `chain_length` is assumed to include the server's own hop
+    as the final element. The `trusted_proxies` rightmost hops are
+    considered to be under the operator's control, so the returned index
+    points to the hop recorded by the outermost trusted proxy, i.e. the
+    first hop to the left of the trusted proxies. Its value describes
+    the client as seen by the trusted chain; any elements further to
+    the left may have been forged by the client or by an untrusted
+    proxy, and must not be used to derive client connection info.
+
+    If the chain contains fewer hops than the number of trusted proxies,
+    all the recorded hops were written by trusted proxies, so the
+    leftmost one (index ``0``) is returned.
+
+    Arguments:
+        chain_length (int): Number of hops in the chain, including the
+            server's own hop as the final element.
+        trusted_proxies (int): Number of trusted rightmost proxy hops.
+            Must be greater than zero.
+
+    Returns:
+        int: Index of the hop holding the client connection info.
+    """
+    return max(chain_length - trusted_proxies - 1, 0)

@@ -42,6 +42,7 @@ from falcon.constants import FALSE_STRINGS
 from falcon.constants import MEDIA_JSON
 from falcon.constants import TRUE_STRINGS
 from falcon.forwarded import _parse_forwarded_header
+from falcon.forwarded import _trusted_hop_index
 from falcon.forwarded import Forwarded
 from falcon.media import Handlers
 from falcon.media.json import _DEFAULT_JSON_HANDLER
@@ -384,6 +385,17 @@ class Request:
 
         return self._cached_forwarded
 
+    def _resolve_forwarded_hop(self, forwarded: list[Forwarded]) -> Forwarded:
+        # Select the forwarded-element holding the client connection info.
+        #   When trusted proxies are configured, the element at the trust
+        #   boundary is used; otherwise, fall back to the historical
+        #   behavior of using the first (leftmost) hop.
+        trusted_proxies = self.options.trusted_proxies
+        if trusted_proxies > 0:
+            return forwarded[_trusted_hop_index(len(forwarded) + 1, trusted_proxies)]
+
+        return forwarded[0]
+
     @property
     def client_accepts_json(self) -> bool:
         """``True`` if the Accept header indicates that the client is
@@ -694,6 +706,13 @@ class Request:
         "proto" parameter in the first hop, the value of
         :attr:`scheme` is returned instead.
 
+        Note:
+            When :attr:`RequestOptions.trusted_proxies` is set to a
+            positive number, the "proto" parameter is read from the hop
+            at the trust boundary instead of the first hop, so that
+            untrusted elements closer to the client cannot rewrite the
+            resolved scheme.
+
         (See also: RFC 7239, Section 1)
         """
         # PERF(kgriffs): Since the Forwarded header is still relatively
@@ -704,8 +723,9 @@ class Request:
         if 'HTTP_FORWARDED' in self.env:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on own scheme
-                scheme = forwarded[0].scheme or self.scheme
+                # Use the hop at the trust boundary (the first hop unless
+                #   trusted proxies are configured), fall back on own scheme
+                scheme = self._resolve_forwarded_hop(forwarded).scheme or self.scheme
             else:
                 scheme = self.scheme
         else:
@@ -827,6 +847,13 @@ class Request:
         :attr:`host` is returned instead.
 
         Note:
+            When :attr:`RequestOptions.trusted_proxies` is set to a
+            positive number, the "host" parameter is read from the hop
+            at the trust boundary instead of the first hop, so that
+            untrusted elements closer to the client cannot rewrite the
+            resolved host.
+
+        Note:
             Reverse proxies are often configured to set the Host
             header directly to the one that was originally
             requested by the user agent; in that case, using
@@ -842,8 +869,9 @@ class Request:
         if 'HTTP_FORWARDED' in self.env:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on self
-                host = forwarded[0].host or self.netloc
+                # Use the hop at the trust boundary (the first hop unless
+                #   trusted proxies are configured), fall back on self
+                host = self._resolve_forwarded_hop(forwarded).host or self.netloc
             else:
                 host = self.netloc
         else:
@@ -968,6 +996,10 @@ class Request:
         :attr:`~.remote_addr` is used instead.
 
         Note:
+            Use :attr:`~.client_addr` to obtain a single client
+            address resolved at the configured proxy trust boundary.
+
+        Note:
             Per `RFC 7239`_, the access route may contain "unknown"
             and obfuscated identifiers, in addition to IPv4 and
             IPv6 addresses
@@ -1011,6 +1043,40 @@ class Request:
                 self._cached_access_route = [self.remote_addr]
 
         return self._cached_access_route
+
+    @property
+    def client_addr(self) -> str:
+        """IP address of the client, resolved at the proxy trust boundary.
+
+        When :attr:`RequestOptions.trusted_proxies` is set to a positive
+        number, the address is resolved by walking the
+        :attr:`~.access_route` from the rightmost hop (closest to the
+        server) towards the client, skipping that many trusted proxy
+        hops. Any addresses further to the left may have been forged by
+        the client or by an untrusted proxy, and are therefore never
+        used. If the route contains fewer hops than the number of
+        trusted proxies, the leftmost recorded address is returned,
+        since all the recorded hops were written by trusted proxies.
+
+        When ``trusted_proxies`` is ``0`` (the default), the leftmost
+        address of the :attr:`~.access_route` is returned, preserving
+        the historical behavior.
+
+        Note:
+            Unlike :attr:`~.access_route`, the returned address is
+            suitable for use as the client identity in logs and other
+            request context, provided that ``trusted_proxies`` has been
+            configured to match the deployment topology.
+
+        .. versionadded:: 4.4
+        """
+        route = self.access_route
+
+        trusted_proxies = self.options.trusted_proxies
+        if trusted_proxies > 0:
+            return route[_trusted_hop_index(len(route), trusted_proxies)]
+
+        return route[0]
 
     @property
     def remote_addr(self) -> str:
@@ -2869,6 +2935,25 @@ class RequestOptions:
     ``application/x-www-form-urlencoded`` and ``multipart/form-data`` media types.
     """
 
+    trusted_proxies: int
+    """Number of trusted proxy hops in front of the app (default ``0``).
+
+    When set to a positive number, the rightmost hops (closest to the
+    app) of the ``Forwarded`` and ``X-Forwarded-For`` chains are
+    considered to be trusted proxies under the operator's control, and
+    the client connection info is resolved at the boundary of the
+    trusted chain by :attr:`Request.client_addr`,
+    :attr:`Request.forwarded_scheme`, and :attr:`Request.forwarded_host`.
+    Any elements further down the chain (towards the client) may have
+    been forged, and are never used to derive the client address,
+    scheme, or host.
+
+    The default of ``0`` preserves the historical behavior of trusting
+    the leftmost element of the ``Forwarded`` chain.
+
+    .. versionadded:: 4.4
+    """
+
     __slots__ = (
         'keep_blank_qs_values',
         '_auto_parse_form_urlencoded',
@@ -2876,6 +2961,7 @@ class RequestOptions:
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
+        'trusted_proxies',
     )
 
     def __init__(self) -> None:
@@ -2885,3 +2971,4 @@ class RequestOptions:
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
+        self.trusted_proxies = 0

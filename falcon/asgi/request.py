@@ -397,8 +397,9 @@ class Request(request.Request):
         if b'forwarded' in self._asgi_headers:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on own scheme
-                scheme = forwarded[0].scheme or self.scheme
+                # Use the hop at the trust boundary (the first hop unless
+                #   trusted proxies are configured), fall back on own scheme
+                scheme = self._resolve_forwarded_hop(forwarded).scheme or self.scheme
             else:
                 scheme = self.scheme
         else:
@@ -443,8 +444,9 @@ class Request(request.Request):
         if b'forwarded' in self._asgi_headers:
             forwarded = self.forwarded
             if forwarded:
-                # Use first hop, fall back on self
-                host = forwarded[0].host or self.netloc
+                # Use the hop at the trust boundary (the first hop unless
+                #   trusted proxies are configured), fall back on self
+                host = self._resolve_forwarded_hop(forwarded).host or self.netloc
             else:
                 host = self.netloc
         else:
@@ -476,6 +478,10 @@ class Request(request.Request):
         not already included in one of the above headers. If the
         "client" field is not available, it will default to
         ``'127.0.0.1'``.
+
+        Note:
+            Use :attr:`~.client_addr` to obtain a single client
+            address resolved at the configured proxy trust boundary.
 
         Note:
             Per `RFC 7239`_, the access route may contain "unknown"
