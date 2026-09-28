@@ -50,6 +50,7 @@ from falcon._typing import SinkPrefix
 import falcon.app
 from falcon.app_helpers import AsyncPreparedMiddlewareResult
 from falcon.app_helpers import AsyncPreparedMiddlewareWsResult
+from falcon.app_helpers import negotiate_media_type
 from falcon.app_helpers import prepare_middleware
 from falcon.app_helpers import prepare_middleware_ws
 from falcon.asgi_spec import AsgiSendMsg
@@ -603,11 +604,30 @@ class App(falcon.app.App[_ReqT, _RespT]):
 
         data: bytes | None = b''
 
+        # NOTE: Negotiate the response media type when the resource
+        #   declared the types it can produce, unless the response can
+        #   not carry a representation anyway (e.g., 204 or 304).
+        negotiated = False
+        if resp.status_code not in _BODILESS_STATUS_CODES:
+            try:
+                negotiated = negotiate_media_type(req, resp)
+            except Exception as ex:
+                if not await self._handle_exception(req, resp, ex, params):
+                    raise
+
+                req_succeeded = False
+
+        skip_render = negotiated and req.method == 'HEAD'
+
         try:
             # NOTE(vytas): It is only safe to inline Response.render_body()
             #   where we can be sure it hasn't been overridden, either directly
             #   or by modifying the behavior of its dependencies.
-            if self._standard_response_type:
+            if skip_render:
+                # NOTE: A negotiated response is not serialized for HEAD,
+                #   since the body would be discarded anyway.
+                data = None
+            elif self._standard_response_type:
                 # PERF(vytas): inline Response.render_body() in this critical code
                 #   path in order to shave off an await.
                 text = resp.text
@@ -675,7 +695,10 @@ class App(falcon.app.App[_ReqT, _RespT]):
                     # NOTE(kgriffs): If they are going to stream using an
                     #   async generator, we can't know in advance what the
                     #   content length will be.
-                    (data is not None or not resp.stream)
+                    # NOTE: A negotiated response is not serialized for
+                    #   HEAD, so its content length is unknown.
+                    not skip_render
+                    and (data is not None or not resp.stream)
                     and req.method == 'HEAD'
                     and resp_status not in _BODILESS_STATUS_CODES
                     and 'content-length' not in resp._headers

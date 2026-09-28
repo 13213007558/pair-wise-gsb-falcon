@@ -39,8 +39,10 @@ from falcon.constants import MEDIA_JSON
 from falcon.constants import MEDIA_XML
 from falcon.errors import CompatibilityError
 from falcon.errors import HTTPError
+from falcon.errors import HTTPNotAcceptable
 from falcon.request import Request
 from falcon.response import Response
+from falcon.util import mediatypes
 from falcon.util.sync import _wrap_non_coroutine_unsafe
 
 __all__ = (
@@ -364,6 +366,88 @@ def default_serialize_error(req: Request, resp: Response, exception: HTTPError) 
 
     resp.append_header('Vary', 'Accept')
 
+
+def negotiate_media_type(req: Request, resp: Response) -> bool:
+    """Negotiate the response media type declared by the resource.
+
+    When :attr:`resp.media_types <falcon.Response.media_types>` declares
+    one or more media types, and the response carries a
+    :attr:`~falcon.Response.media` value to serialize, the best type is
+    selected according to the request's ``Accept`` header (see
+    :func:`falcon.util.mediatypes.best_match`), and assigned to
+    :attr:`resp.content_type <falcon.Response.content_type>`, unless the
+    latter was already set explicitly. When the negotiation takes place,
+    ``Accept`` is also merged into the response's ``Vary`` header.
+
+    Args:
+        req: Instance of ``falcon.Request``.
+        resp: Instance of ``falcon.Response``.
+
+    Returns:
+        bool: ``True`` if the response declares media types and carries
+        a ``media`` value (i.e., the negotiation logic applies to this
+        response), otherwise ``False``.
+
+    Raises:
+        HTTPNotAcceptable: The client does not accept any of the declared
+            media types that the app is able to serialize.
+    """
+    declared = resp.media_types
+    if not declared or resp.media is None:
+        return False
+
+    if resp.content_type is not None:
+        # NOTE: An explicitly set Content-Type always takes precedence,
+        #   and it is used as-is, i.e., the responder is assumed to have
+        #   performed any desired content negotiation itself.
+        return True
+
+    media_types = tuple(declared)
+    options = resp.options
+
+    # NOTE: A declared type is only taken into consideration when the app
+    #   can actually serialize it, i.e., a corresponding media handler is
+    #   registered. Otherwise, the type is treated as unavailable, which
+    #   may ultimately lead to a 406 error below, rather than failing
+    #   mid-serialization.
+    producible = tuple(
+        media_type
+        for media_type in media_types
+        if options.media_handlers._resolve(
+            media_type, options.default_media_type, raise_not_found=False
+        )[0]
+        is not None
+    )
+
+    selected = None
+    if producible:
+        try:
+            selected = mediatypes.best_match(producible, req.accept) or None
+        except ValueError:
+            # NOTE: Treat an unparsable Accept header as not accepting
+            #   any of the declared types to keep the behavior predictable.
+            pass
+
+    if selected is None:
+        raise HTTPNotAcceptable(
+            description=(
+                'The resource does not have a current representation that '
+                'would be acceptable to the user agent. Supported media '
+                'types: ' + ', '.join(media_types) + '.'
+            )
+        )
+
+    resp.content_type = selected
+
+    # NOTE: Merge Accept into Vary, preserving any existing values, and
+    #   taking care not to duplicate Accept if it is already present.
+    vary = resp.vary
+    if vary is None or 'accept' not in (
+        value.strip().lower() for value in vary.split(',')
+    ):
+        resp.append_header('Vary', 'Accept')
+
+    return True
 
 class CloseableStreamIterator:
     """Iterator that wraps a file-like stream with support for close().

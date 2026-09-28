@@ -76,6 +76,7 @@ class Response:
     __slots__ = (
         'text',
         'context',
+        'media_types',
         'options',
         'status',
         'stream',
@@ -159,6 +160,42 @@ class Response:
 
             resp.context.cache_strategy = 'lru'
     """
+    media_types: Iterable[str] | None
+    """One or more Internet media types the resource can produce for
+    :attr:`media`, in the order of preference (default ``None``).
+
+    When this attribute is set to a non-empty collection of media types, and
+    :attr:`content_type` has not been set explicitly, the framework will
+    negotiate the response's ``Content-Type`` against the request's
+    ``Accept`` header, taking into account quality (``q``) values, the
+    precedence of concrete types over wildcards, and explicit exclusions
+    (``q=0``). If several declared types are equally acceptable to the
+    client, the first one declared wins. When the request has no ``Accept``
+    header, the first declared type is also used as the default
+    representation.
+
+    If the client does not accept any of the declared types that the
+    application can serialize (i.e., types with a registered media handler),
+    the request fails with an ``HTTP 406``
+    (:class:`~falcon.HTTPNotAcceptable`) error, and :attr:`media` is not
+    serialized.
+
+    When the negotiation takes place, ``Accept`` is merged into the
+    response's ``Vary`` header, preserving any existing values. For
+    ``HEAD`` requests, as well as for statuses without a response body
+    (such as ``204``), the media is not serialized; in the latter case,
+    no negotiation is performed at all.
+
+    Note:
+        Setting :attr:`content_type` explicitly opts out of the automatic
+        negotiation: the provided value is used as-is, and it is never
+        rewritten by the framework.
+
+    Note:
+        This attribute only affects the serialization of the response
+        :attr:`media`; it has no effect on the parsing of the request
+        body, nor on how error responses are rendered.
+    """
     options: ResponseOptions
     """Set of global options passed in from the App handler."""
 
@@ -185,6 +222,7 @@ class Response:
         self._data = None
         self._media = None
         self._media_rendered = _UNSET
+        self.media_types = None
 
         self.context = self.context_type()
 

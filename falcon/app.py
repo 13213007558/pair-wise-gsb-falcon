@@ -501,11 +501,29 @@ class App(Generic[_ReqT, _RespT]):
 
                 req_succeeded = False
 
+        # NOTE: Negotiate the response media type when the resource
+        #   declared the types it can produce, unless the response can
+        #   not carry a representation anyway (e.g., 204 or 304).
+        negotiated = False
+        if code_to_http_status(resp.status) not in _BODILESS_STATUS_CODES:
+            try:
+                negotiated = helpers.negotiate_media_type(req, resp)
+            except Exception as ex:
+                if not self._handle_exception(req, resp, ex, params):
+                    raise
+
+                req_succeeded = False
+
         body: Iterable[bytes]
         length: int | None
 
         try:
-            body, length = self._get_body(resp, env.get('wsgi.file_wrapper'))
+            if negotiated and req.method == 'HEAD':
+                # NOTE: A negotiated response is not serialized for HEAD,
+                #   since the body would be discarded anyway.
+                body, length = [], None
+            else:
+                body, length = self._get_body(resp, env.get('wsgi.file_wrapper'))
         except Exception as ex:
             if not self._handle_exception(req, resp, ex, params):
                 raise
