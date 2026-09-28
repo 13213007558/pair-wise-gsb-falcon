@@ -164,6 +164,28 @@ class TestTextPlainHandler:
         assert response.text == payload
 
 
+class TestContentNegotiation:
+    def test_negotiation_basic(self, util):
+        recipe = util.load_module('examples/recipes/content_negotiation.py')
+        client = falcon.testing.TestClient(recipe.app)
+
+        response = client.simulate_get('/sensors')
+        assert response.status_code == 200
+        assert response.content_type == 'application/json'
+        assert response.headers['Vary'] == 'Accept'
+        assert response.json[0] == ['timestamp', 'temperature']
+
+        response = client.simulate_get('/sensors', headers={'Accept': 'text/csv'})
+        assert response.status_code == 200
+        assert response.content_type == 'text/csv'
+        assert response.text.startswith('timestamp,temperature\r\n')
+
+        response = client.simulate_get(
+            '/sensors', headers={'Accept': 'application/json;q=0'}
+        )
+        assert response.status_code == 406
+
+
 class TestRequestIDContext:
     @pytest.fixture(params=['middleware', 'structlog'])
     def app(self, request, util, register_module):
