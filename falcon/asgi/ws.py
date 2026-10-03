@@ -43,6 +43,7 @@ class WebSocket:
         '_buffered_receiver',
         '_close_code',
         '_close_reasons',
+        '_subprotocol',
         '_supports_accept_headers',
         '_supports_reason',
         '_mh_bin_deserialize',
@@ -57,6 +58,7 @@ class WebSocket:
     _asgi_send: AsgiSend
     _state: _WebSocketState
     _close_code: int | None
+    _subprotocol: str | None
     subprotocols: tuple[str, ...]
     """The list of subprotocol strings advertised by the client, or an empty tuple if
     no subprotocols were specified.
@@ -108,6 +110,19 @@ class WebSocket:
         self._close_reasons = default_close_reasons
         self._state = _WebSocketState.HANDSHAKE
         self._close_code = None
+        self._subprotocol = None
+
+    @property
+    def subprotocol(self) -> str | None:
+        """The subprotocol negotiated for this connection, or ``None``.
+
+        When the connection was routed via
+        :meth:`falcon.asgi.App.add_websocket_route`, this property holds the
+        subprotocol that the framework selected during the handshake, before
+        :meth:`~.accept` is called. Otherwise, it is set once the connection
+        has been accepted with an explicit subprotocol.
+        """
+        return self._subprotocol
 
     @property
     def unaccepted(self) -> bool:
@@ -195,6 +210,12 @@ class WebSocket:
                 'accept() may only be called once on an open WebSocket connection'
             )
 
+        if subprotocol is None:
+            # When the connection was routed by subprotocol via
+            #   App.add_websocket_route(), default to the subprotocol that
+            #   was negotiated during dispatch.
+            subprotocol = self._subprotocol
+
         event: dict[str, Any] = {
             'type': EventType.WS_ACCEPT,
         }
@@ -204,6 +225,7 @@ class WebSocket:
                 raise ValueError('WebSocket subprotocol must be a string')
 
             event['subprotocol'] = subprotocol
+            self._subprotocol = subprotocol
 
         if headers:
             if not self._supports_accept_headers:

@@ -62,6 +62,7 @@ from falcon.errors import WebSocketDisconnected
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
 from falcon.media.multipart import MultipartFormHandler
+from falcon.routing.compiled import UnacceptableRouteError
 from falcon.util.deprecation import DeprecatedWarning
 from falcon.util.misc import _has_arg_name
 from falcon.util.misc import is_python_func
@@ -71,6 +72,8 @@ from falcon.util.sync import wrap_sync_to_async
 
 from ._asgi_helpers import _validate_asgi_scope
 from ._asgi_helpers import _wrap_asgi_coroutine_func
+from ._ws_subprotocols import websocket_responder_name
+from ._ws_subprotocols import WebSocketSubprotocolMap
 from .multipart import MultipartForm
 from .request import Request
 from .response import Response
@@ -346,6 +349,9 @@ class App(falcon.app.App[_ReqT, _RespT]):
     __slots__ = (
         '_standard_response_type',
         '_middleware_ws',
+        '_route_templates',
+        '_ws_route_templates',
+        '_ws_subprotocol_routes',
         'ws_options',
     )
 
@@ -354,7 +360,10 @@ class App(falcon.app.App[_ReqT, _RespT]):
     _middleware_ws: AsyncPreparedMiddlewareWsResult
     _request_type: type[_ReqT]
     _response_type: type[_RespT]
+    _route_templates: set[str]
     _unprepared_middleware: list[AsyncMiddleware[_ReqT, _RespT]]  # type: ignore[assignment]
+    _ws_route_templates: set[str]
+    _ws_subprotocol_routes: dict[str, WebSocketSubprotocolMap]
 
     ws_options: WebSocketOptions
     """A set of behavioral options related to WebSocket connections.
@@ -448,6 +457,15 @@ class App(falcon.app.App[_ReqT, _RespT]):
 
         self.ws_options = WebSocketOptions()
         self._standard_response_type = response_type in (None, Response)
+
+        # WebSocket subprotocol routing state. _ws_subprotocol_routes
+        #   maps a URI template to its subprotocol dispatch table, while
+        #   _ws_route_templates tracks templates that were registered via
+        #   add_route() with a resource defining on_websocket(), in order
+        #   to detect conflicting registrations at startup.
+        self._ws_subprotocol_routes: dict[str, WebSocketSubprotocolMap] = {}
+        self._ws_route_templates: set[str] = set()
+        self._route_templates: set[str] = set()
 
         self.add_error_handler(
             WebSocketDisconnected, self._ws_disconnected_error_handler
@@ -931,9 +949,143 @@ class App(falcon.app.App[_ReqT, _RespT]):
         #   will know to validate the responder methods to make sure they
         #   are async coroutines.
         kwargs['_asgi'] = True
+
+        ws_responder_name = websocket_responder_name(kwargs.get('suffix'))
+        has_ws_responder = getattr(resource, ws_responder_name, None) is not None
+        if has_ws_responder and uri_template in self._ws_subprotocol_routes:
+            raise UnacceptableRouteError(
+                'The URI template {} already hosts WebSocket subprotocol '.format(
+                    uri_template
+                )
+                + 'routes; a plain {}() responder may not be combined with '.format(
+                    ws_responder_name
+                )
+                + 'them for the same template.'
+            )
+
         super().add_route(uri_template, resource, **kwargs)
 
+        self._route_templates.add(uri_template)
+        if has_ws_responder:
+            self._ws_route_templates.add(uri_template)
+        else:
+            # The template may be re-registered with a resource that
+            #   no longer defines a WebSocket responder.
+            self._ws_route_templates.discard(uri_template)
+
     add_route.__doc__ = falcon.app.App.add_route.__doc__  # NOTE: not really required
+
+    def add_websocket_route(
+        self,
+        uri_template: str,
+        resource: Resource,
+        subprotocols: str | Iterable[str] | None = None,
+        *,
+        suffix: str | None = None,
+    ) -> None:
+        """Associate a templatized URI path with WebSocket subprotocols.
+
+        A single URI template may host multiple WebSocket resources, each
+        responsible for one or more subprotocols (for example, different
+        versions of a messaging protocol). During the opening handshake,
+        the framework selects the resource to handle the connection by
+        matching the subprotocols advertised by the client against the
+        registered ones. When the client offers more than one supported
+        subprotocol, the resource that was registered first takes
+        precedence, regardless of the order in which the client
+        advertised its candidates.
+
+        The negotiated subprotocol is exposed via
+        :attr:`falcon.asgi.WebSocket.subprotocol`, and it is
+        automatically included in the handshake response when the
+        connection is accepted via
+        :meth:`falcon.asgi.WebSocket.accept` without an explicit
+        ``subprotocol`` argument.
+
+        If the client does not offer any of the registered subprotocols,
+        the handshake is rejected before the connection is accepted,
+        unless a fallback resource was explicitly registered by passing
+        ``subprotocols=None``.
+
+        Regular HTTP routes may be registered for the same
+        ``uri_template`` via :meth:`~.add_route`; those continue to be
+        dispatched by HTTP method as usual. However, combining WebSocket
+        subprotocol routes with a plain ``on_websocket()`` responder for
+        the same template is considered a conflict, as is registering
+        the same subprotocol (or fallback) more than once; such
+        configuration errors are raised immediately.
+
+        Note:
+            The ``on_websocket()`` responder of each resource must be
+            an awaitable coroutine function.
+
+        Args:
+            uri_template (str): A templatized URI. Care must be
+                taken to ensure the template does not mask any sink
+                patterns, if any are registered.
+
+                (See also: :meth:`~.App.add_sink`)
+
+            resource (instance): Object which represents a REST
+                resource. Falcon will pass WebSocket connections to its
+                ``on_websocket()`` responder when one of the registered
+                subprotocols is negotiated.
+
+            subprotocols (str | Iterable[str]): One or more subprotocol
+                names handled by this resource. When ``None`` (the
+                default), the resource is registered as the fallback
+                that handles connections for which no registered
+                subprotocol matched, including clients that do not
+                advertise any subprotocol.
+
+        Keyword Args:
+            suffix (str): Optional responder name suffix for this
+                route. If a suffix is provided, Falcon will map
+                WebSocket connections to ``on_websocket_{suffix}()``
+                instead of ``on_websocket()``.
+
+        Raises:
+            UnacceptableRouteError: A conflicting or duplicate
+                registration was attempted, or the resource does not
+                implement the expected responder.
+            ValueError: The URI template or a subprotocol name is
+                invalid.
+            TypeError: The responder is not an async coroutine
+                function.
+        """
+
+        if not isinstance(uri_template, str):
+            raise TypeError('uri_template is not a string')
+
+        if not uri_template.startswith('/'):
+            raise ValueError("uri_template must start with '/'")
+
+        if '//' in uri_template:
+            raise ValueError("uri_template may not contain '//'")
+
+        if uri_template in self._ws_route_templates:
+            raise UnacceptableRouteError(
+                'The URI template {} already has a route with an '.format(uri_template)
+                + 'on_websocket() responder; WebSocket subprotocol routes '
+                + 'may not be combined with it for the same template.'
+            )
+
+        if uri_template not in self._route_templates:
+            # Register a placeholder so that the router can match
+            #   the template (including any field converters); the actual
+            #   resource is selected by subprotocol when the connection
+            #   is dispatched. HTTP requests receive the default 405
+            #   responder unless a resource is also registered via
+            #   add_route().
+            self._router.add_route(
+                uri_template, _WebSocketRoutePlaceholder(), _asgi=True
+            )
+            self._route_templates.add(uri_template)
+
+        ws_map = self._ws_subprotocol_routes.setdefault(
+            uri_template, WebSocketSubprotocolMap()
+        )
+        ws_map.add(uri_template, resource, subprotocols, suffix)
 
     def add_sink(  # type: ignore[override]
         self, sink: AsgiSinkCallable[_ReqT, _RespT], prefix: SinkPrefix = r'/'
@@ -1239,6 +1391,19 @@ class App(falcon.app.App[_ReqT, _RespT]):
             on_websocket: AsgiResponderWsCallable
             on_websocket, params, resource, req.uri_template = self._get_responder(req)  # type: ignore[assignment]
 
+            if req.uri_template is not None:
+                ws_map = self._ws_subprotocol_routes.get(req.uri_template)
+                if ws_map is not None:
+                    # The template hosts subprotocol-routed WebSocket
+                    #   resources; select the one to handle the connection
+                    #   based on the subprotocols advertised by the client.
+                    #   This may raise HTTPForbidden in order to reject the
+                    #   handshake before the connection is accepted.
+                    on_websocket, resource, subprotocol = ws_map.resolve(
+                        web_socket.subprotocols
+                    )
+                    web_socket._subprotocol = subprotocol
+
             # NOTE(kgriffs): If the request did not match any
             # route, a default responder is returned and the
             # resource is None. In that case, we skip the
@@ -1500,3 +1665,15 @@ class App(falcon.app.App[_ReqT, _RespT]):
                     exc_info=True,
                 )
                 raise
+
+
+class _WebSocketRoutePlaceholder:
+    """Placeholder resource for subprotocol-routed URI templates.
+
+    An instance of this class is registered with the router when a URI
+    template is only referenced by
+    :meth:`falcon.asgi.App.add_websocket_route`, so that the template can
+    be matched (including any field converters). The actual resource is
+    selected by subprotocol when the WebSocket connection is dispatched;
+    HTTP requests receive the default responders.
+    """
