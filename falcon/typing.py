@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Optional, Protocol, TYPE_CHECKING
+from collections.abc import Iterable
+from collections.abc import Mapping
+from typing import Optional, Protocol, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from falcon.asgi import SSEvent
@@ -26,6 +28,7 @@ __all__ = (
     'ReadableIO',
     'AsyncReadableIO',
     'SSEEmitter',
+    'WebSocketSubprotocolMap',
 )
 
 Headers = dict[str, str]
@@ -64,4 +67,19 @@ SSEEmitter = AsyncIterator[Optional['SSEvent']]
 (instances of :class:`falcon.asgi.SSEvent`).
 
 .. versionadded:: 4.0
+"""
+
+WebSocketSubprotocolMap = Union[
+    Mapping[str, object],
+    Iterable[tuple[str, object]],
+]
+"""Mapping of WebSocket subprotocol names to resources.
+
+Used by :meth:`falcon.asgi.App.add_websocket_route` to register a
+WebSocket route that dispatches connections to different resources
+according to the negotiated subprotocol. May also be given as an
+iterable of ``(name, resource)`` pairs; in either case, the iteration
+order defines the server's preference during subprotocol negotiation.
+
+.. versionadded:: 4.4
 """

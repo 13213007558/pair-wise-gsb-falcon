@@ -1126,7 +1126,7 @@ def create_scope_ws(
     remote_addr: str | None = None,
     root_path: str | None = None,
     include_server: bool = True,
-    subprotocols: str | None = None,
+    subprotocols: Iterable[str] | None = None,
     spec_version: str = '2.1',
 ) -> dict[str, Any]:
     """Create a mock ASGI scope ``dict`` for simulating WebSocket requests.

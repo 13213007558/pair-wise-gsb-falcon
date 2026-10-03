@@ -46,6 +46,7 @@ from falcon._typing import AsgiSend
 from falcon._typing import AsgiSinkCallable
 from falcon._typing import AsyncMiddleware
 from falcon._typing import Resource
+from falcon._typing import ResponderCallable
 from falcon._typing import SinkPrefix
 import falcon.app
 from falcon.app_helpers import AsyncPreparedMiddlewareResult
@@ -62,6 +63,7 @@ from falcon.errors import WebSocketDisconnected
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
 from falcon.media.multipart import MultipartFormHandler
+from falcon.typing import WebSocketSubprotocolMap
 from falcon.util.deprecation import DeprecatedWarning
 from falcon.util.misc import _has_arg_name
 from falcon.util.misc import is_python_func
@@ -71,6 +73,8 @@ from falcon.util.sync import wrap_sync_to_async
 
 from ._asgi_helpers import _validate_asgi_scope
 from ._asgi_helpers import _wrap_asgi_coroutine_func
+from ._ws_subprotocols import defines_websocket_responder
+from ._ws_subprotocols import WebSocketSubprotocolDispatcher
 from .multipart import MultipartForm
 from .request import Request
 from .response import Response
@@ -346,13 +350,19 @@ class App(falcon.app.App[_ReqT, _RespT]):
     __slots__ = (
         '_standard_response_type',
         '_middleware_ws',
+        '_plain_ws_route_templates',
+        '_route_resources',
+        '_ws_subprotocol_routes',
         'ws_options',
     )
 
     _error_handlers: dict[type[Exception], AsgiErrorHandler[_ReqT, _RespT]]  # type: ignore[assignment]
     _middleware: AsyncPreparedMiddlewareResult  # type: ignore[assignment]
     _middleware_ws: AsyncPreparedMiddlewareWsResult
+    _plain_ws_route_templates: set[str]
     _request_type: type[_ReqT]
+    _route_resources: dict[str, Resource]
+    _ws_subprotocol_routes: dict[str, WebSocketSubprotocolDispatcher]
     _response_type: type[_RespT]
     _unprepared_middleware: list[AsyncMiddleware[_ReqT, _RespT]]  # type: ignore[assignment]
 
@@ -448,6 +458,10 @@ class App(falcon.app.App[_ReqT, _RespT]):
 
         self.ws_options = WebSocketOptions()
         self._standard_response_type = response_type in (None, Response)
+
+        self._ws_subprotocol_routes: dict[str, WebSocketSubprotocolDispatcher] = {}
+        self._route_resources: dict[str, Resource] = {}
+        self._plain_ws_route_templates: set[str] = set()
 
         self.add_error_handler(
             WebSocketDisconnected, self._ws_disconnected_error_handler
@@ -931,9 +945,122 @@ class App(falcon.app.App[_ReqT, _RespT]):
         #   will know to validate the responder methods to make sure they
         #   are async coroutines.
         kwargs['_asgi'] = True
+
+        dispatcher = self._ws_subprotocol_routes.get(uri_template)
+        if dispatcher is None:
+            self._route_resources[uri_template] = resource
+            if defines_websocket_responder(resource, kwargs.get('suffix')):
+                self._plain_ws_route_templates.add(uri_template)
+            else:
+                self._plain_ws_route_templates.discard(uri_template)
+        else:
+            # NOTE: The URI template was already registered via
+            #   add_websocket_route(); the HTTP responders of the resource
+            #   are merged into the existing route so that both HTTP
+            #   requests and WebSocket connections keep working.
+            if defines_websocket_responder(resource, kwargs.get('suffix')):
+                raise CompatibilityError(
+                    'The resource can not be added to the route '
+                    f'{uri_template!r} because it defines a WebSocket '
+                    'responder, but a WebSocket subprotocol route was '
+                    'already registered for that path.'
+                )
+            dispatcher.http_resource = resource
+            resource = dispatcher
+
         super().add_route(uri_template, resource, **kwargs)
 
     add_route.__doc__ = falcon.app.App.add_route.__doc__  # NOTE: not really required
+
+    def add_websocket_route(
+        self,
+        uri_template: str,
+        subprotocols: WebSocketSubprotocolMap,
+        *,
+        fallback: Resource | None = None,
+        suffix: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Associate a URI template with WebSocket subprotocol resources.
+
+        A single route may serve several versions of a WebSocket
+        subprotocol, each implemented by a different resource. When a
+        client connects, Falcon negotiates the subprotocol during the
+        handshake and dispatches the connection to the corresponding
+        resource's ``on_websocket()`` responder. The first registered
+        subprotocol (in order of server preference) that is also offered
+        by the client is selected, regardless of the order in which the
+        client advertised its candidates.
+
+        If the client offers no common subprotocol, the handshake is
+        rejected before the connection is accepted, unless a `fallback`
+        resource was explicitly configured to handle connections without
+        a negotiated subprotocol.
+
+        HTTP requests to the same path are unaffected: a resource with
+        HTTP responders may be registered for the same `uri_template`
+        via :meth:`~.add_route` (either before or after calling this
+        method), and its responders will continue to be dispatched
+        according to the HTTP method.
+
+        Note:
+            This method is only available for ASGI apps, and registering
+            a subprotocol that duplicates or conflicts with an existing
+            registration for the same path raises an error immediately.
+
+        Args:
+            uri_template (str): A templatized URI, as accepted by
+                :meth:`~.add_route`. Path template fields and converters
+                are passed to the selected WebSocket responder as usual.
+            subprotocols: A mapping of subprotocol names to resources
+                (or an iterable of ``(name, resource)`` pairs). The
+                iteration order defines the server's preference when
+                negotiating with the client. Each resource must implement
+                an ``on_websocket()`` responder (or
+                ``on_websocket_{suffix}()`` when `suffix` is given).
+
+        Keyword Args:
+            fallback: Optional resource used when the client offers no
+                acceptable subprotocol (or none at all). When no
+                fallback is configured, such connections are rejected
+                before being accepted (default ``None``).
+            suffix (str): Optional responder name suffix for this route,
+                causing Falcon to map WebSocket connections to
+                ``on_websocket_{suffix}()`` responders instead of
+                ``on_websocket()`` (default ``None``).
+
+        Note:
+            Any additional keyword arguments not defined above are passed
+            through to the underlying router's ``add_route()`` method,
+            as with :meth:`~.add_route`.
+        """
+        if uri_template in self._ws_subprotocol_routes:
+            raise CompatibilityError(
+                'A WebSocket subprotocol route was already registered for '
+                f'{uri_template!r}.'
+            )
+
+        if uri_template in self._plain_ws_route_templates:
+            raise CompatibilityError(
+                'A route with a WebSocket responder was already registered '
+                f'for {uri_template!r}; it can not be combined with a '
+                'WebSocket subprotocol route.'
+            )
+
+        dispatcher = WebSocketSubprotocolDispatcher(
+            subprotocols, fallback=fallback, suffix=suffix
+        )
+        dispatcher.http_resource = self._route_resources.get(uri_template)
+
+        kwargs['_asgi'] = True
+        if suffix is not None:
+            kwargs['suffix'] = suffix
+
+        # NOTE: Register the dispatcher with the router before recording
+        #   the route, so that an invalid URI template does not leave
+        #   stale state behind.
+        super().add_route(uri_template, dispatcher, **kwargs)
+        self._ws_subprotocol_routes[uri_template] = dispatcher
 
     def add_sink(  # type: ignore[override]
         self, sink: AsgiSinkCallable[_ReqT, _RespT], prefix: SinkPrefix = r'/'
@@ -1199,6 +1326,29 @@ class App(falcon.app.App[_ReqT, _RespT]):
                 await send({'type': EventType.LIFESPAN_SHUTDOWN_COMPLETE})
                 return
 
+    def _get_responder(
+        self, req: _ReqT
+    ) -> tuple[
+        ResponderCallable | AsgiResponderCallable | AsgiResponderWsCallable,
+        dict[str, Any],
+        object,
+        str | None,
+    ]:
+        responder, params, resource, uri_template = super()._get_responder(req)
+
+        # NOTE: For HTTP requests to a route that was registered via
+        #   add_websocket_route(), unwrap the dispatcher so that
+        #   middleware and error handling observe the HTTP resource that
+        #   shares the route, rather than the internal dispatcher.
+        if (
+            not req.is_websocket
+            and isinstance(resource, WebSocketSubprotocolDispatcher)
+            and resource.http_resource is not None
+        ):
+            resource = resource.http_resource
+
+        return responder, params, resource, uri_template
+
     async def _handle_websocket(
         self, ver: str, scope: dict[str, Any], receive: AsgiReceive, send: AsgiSend
     ) -> None:
@@ -1238,6 +1388,15 @@ class App(falcon.app.App[_ReqT, _RespT]):
 
             on_websocket: AsgiResponderWsCallable
             on_websocket, params, resource, req.uri_template = self._get_responder(req)  # type: ignore[assignment]
+
+            if isinstance(resource, WebSocketSubprotocolDispatcher):
+                # The route was registered via add_websocket_route();
+                # select the resource and responder according to the
+                # subprotocols offered by the client. When no common
+                # subprotocol is found and no fallback was configured,
+                # HTTPForbidden is raised and the handshake is rejected
+                # before the connection is accepted.
+                resource, on_websocket = resource.select(web_socket.subprotocols)
 
             # NOTE(kgriffs): If the request did not match any
             # route, a default responder is returned and the

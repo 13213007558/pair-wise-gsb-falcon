@@ -124,6 +124,70 @@ Similarly, if a route exists but the target resource does not implement an
 raises an instance of :class:`~.HTTPMethodNotAllowed`. This class will be
 rendered by default as a 403 response with a 3405 close code.
 
+.. _ws_subprotocol_routing:
+
+Subprotocol Routing
+-------------------
+
+A single route may serve multiple versions of a WebSocket subprotocol,
+each implemented by a separate resource. Use
+:meth:`falcon.asgi.App.add_websocket_route` to map subprotocol names to
+resources, and Falcon will negotiate the subprotocol during the handshake
+and dispatch the connection to the corresponding resource's
+``on_websocket()`` responder:
+
+.. code:: python
+
+    import falcon.asgi
+
+
+    class ChatV1Resource:
+        async def on_websocket(self, req, ws, room):
+            await ws.accept(subprotocol='chat.v1')
+            # ...
+
+
+    class ChatV2Resource:
+        async def on_websocket(self, req, ws, room):
+            await ws.accept(subprotocol='chat.v2')
+            # ...
+
+
+    app = falcon.asgi.App()
+    app.add_websocket_route(
+        '/ws/{room}',
+        {
+            'chat.v2': ChatV2Resource(),
+            'chat.v1': ChatV1Resource(),
+        },
+    )
+
+When the client offers more than one of the registered subprotocols, the
+first one (in order of server preference, i.e., the order in which the
+subprotocols were registered) that is also offered by the client is
+selected, regardless of the order in which the client advertised its
+candidates. Path template fields, converters, middleware, and error
+handling all work as usual, with the selected resource.
+
+If the client offers no common subprotocol (or none at all), the
+handshake is rejected before the connection is accepted, unless a
+fallback resource was explicitly configured via the ``fallback`` keyword
+argument:
+
+.. code:: python
+
+    app.add_websocket_route(
+        '/ws/{room}',
+        {'chat.v2': ChatV2Resource()},
+        fallback=LegacyChatResource(),
+    )
+
+Registering a duplicate or conflicting subprotocol route (including a
+combination with a plain ``on_websocket()`` route for the same path)
+raises an error as soon as the route is added. HTTP responders registered
+for the same path via :meth:`~falcon.asgi.App.add_route` are unaffected,
+and continue to be dispatched according to the HTTP method.
+
 .. _ws_lost_connection:
 
 Lost Connections
