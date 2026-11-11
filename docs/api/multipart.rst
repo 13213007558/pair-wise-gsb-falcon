@@ -119,6 +119,9 @@ way is to directly modify the properties of this attribute on the media handler
     # Allow an unlimited number of body parts in the form
     handler.parse_options.max_body_part_count = 0
 
+    # Cap the cumulative payload of all body parts to 8 MiB in total
+    handler.parse_options.max_body_part_total_size = 8 * 1024 * 1024
+
     # Afford parsing msgpack-encoded body parts directly via part.get_media()
     extra_handlers = {
         falcon.MEDIA_MSGPACK: falcon.media.MessagePackHandler(),

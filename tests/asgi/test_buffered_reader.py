@@ -147,6 +147,14 @@ def test_delimit(reader1, delimiter, expected):
     assert async_take(delimited) == expected
 
 
+async def test_delimit_on_data(reader1):
+    accounted = []
+    delimited = reader1.delimit(b'ting', on_data=accounted.append)
+    chunks = [chunk async for chunk in delimited]
+    assert chunks == [b'Hello, World!', b'\nJust tes']
+    assert accounted == [len(chunk) for chunk in chunks]
+
+
 async def test_exhaust(reader1):
     await reader1.exhaust()
     assert await reader1.peek() == b''

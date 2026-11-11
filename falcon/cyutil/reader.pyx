@@ -23,6 +23,7 @@ import io
 
 from falcon.errors import DelimiterError
 from falcon.util.reader import DEFAULT_CHUNK_SIZE, _MAX_JOIN_CHUNKS
+from falcon.util.reader import _wrap_with_data_callback
 
 
 cdef class BufferedReader:
@@ -375,8 +376,10 @@ cdef class BufferedReader:
     def exhaust(self):
         self.pipe()
 
-    def delimit(self, delimiter):
+    def delimit(self, delimiter, on_data=None):
         read = functools.partial(self.read_until, delimiter)
+        if on_data is not None:
+            read = _wrap_with_data_callback(read, on_data)
         return type(self)(read, self._normalize_size(None), self._chunk_size)
 
     def readline(self, size=-1):

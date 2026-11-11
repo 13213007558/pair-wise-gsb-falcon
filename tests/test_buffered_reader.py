@@ -282,6 +282,19 @@ def test_pipe_until_without_destination(buffered_reader):
     assert stream.peek(22) == b'--boundary1234567890--'
 
 
+def test_delimit_on_data(buffered_reader):
+    stream = buffered_reader(2**16)
+    accounted = []
+    delimited = stream.delimit(
+        b'--boundary1234567890--', on_data=accounted.append
+    )
+    output = io.BytesIO()
+    delimited.pipe(output)
+    content = output.getvalue()
+    assert len(content) == 64 * 1024**2
+    assert sum(accounted) == len(content)
+
+
 def test_exhaust(shorter_stream):
     shorter_stream.exhaust()
     assert not shorter_stream.read()

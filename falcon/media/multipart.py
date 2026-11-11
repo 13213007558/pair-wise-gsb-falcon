@@ -59,6 +59,36 @@ _ALLOWED_CONTENT_HEADERS = frozenset(
     ]
 )
 
+
+class _BodySizeBudget:
+    """Form-wide cumulative budget for the body part content bytes.
+
+    A single budget is shared between all the body part streams of a form so
+    that the bytes actually delivered to the caller (or skipped while moving
+    on to the next part) are counted exactly once, regardless of which read
+    interface (``stream.read()``, :attr:`BodyPart.data`, :attr:`BodyPart.text`,
+    :attr:`BodyPart.media`, pipe/exhaust, or simply iterating past a part) was
+    used.
+    """
+
+    __slots__ = ('_consumed', '_limit')
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._consumed = 0
+
+    def charge(self, size: int) -> None:
+        if not size:
+            return
+
+        self._consumed += size
+        # NOTE: The limit is inclusive: content exactly equal to it is allowed.
+        if self._limit and self._consumed > self._limit:
+            raise MultipartParseError(
+                description='total body part content size limit exceeded'
+            )
+
+
 _FILENAME_STAR_RFC5987 = re.compile(r"([\w-]+)'[\w]*'(.+)")
 
 _CRLF = b'\r\n'
@@ -361,6 +391,9 @@ class MultipartForm:
         #   (see the note below).
         self._dash_boundary = b'--' + boundary
         self._parse_options = parse_options
+        self._body_budget = _BodySizeBudget(
+            parse_options.max_body_part_total_size
+        )
 
     def __iter__(self) -> Iterator[BodyPart]:
         prologue = True
@@ -368,8 +401,18 @@ class MultipartForm:
         stream = self._stream
         max_headers_size = self._parse_options.max_body_part_headers_size
         remaining_parts = self._parse_options.max_body_part_count
+        previous_part: BodyPart | None = None
 
         while True:
+            # NOTE: Drain the body part yielded by the previous iteration (if
+            #   any) through its own delimited stream. This way content that
+            #   the caller never read is still charged against the form-wide
+            #   budget, while bytes already handed over are never counted a
+            #   second time.
+            if previous_part is not None:
+                previous_part.stream.exhaust()
+                previous_part = None
+
             # NOTE(vytas): Either exhaust the unused stream part, or skip
             #   the prologue.
             try:
@@ -445,7 +488,13 @@ class MultipartForm:
                     description='maximum number of form body parts exceeded'
                 )
 
-            yield BodyPart(stream.delimit(delimiter), headers, self._parse_options)
+            part = BodyPart(
+                stream.delimit(delimiter, on_data=self._body_budget.charge),
+                headers,
+                self._parse_options,
+            )
+            previous_part = part
+            yield part
 
 
 class MultipartFormHandler(BaseHandler):
@@ -598,6 +647,26 @@ class MultipartParseOptions:
     If the body part size exceeds this value, an instance of
     :class:`.MultipartParseError` will be raised.
     """
+    max_body_part_total_size: int
+    """The maximum cumulative size, in bytes, of all the body part content in
+    the form (default ``0``, i.e. no limit).
+
+    Only the body part payloads count toward this budget; boundaries,
+    delimiters, and part headers do not. The bytes are accounted for as they
+    are read from a part :attr:`~BodyPart.stream` (including via
+    :attr:`~BodyPart.data`, :attr:`~BodyPart.text`, and
+    :attr:`~BodyPart.media`), or skipped when the application iterates to the
+    next part without reading the current one. Each payload byte is counted at
+    most once, and content whose total size is exactly equal to the limit is
+    still accepted.
+
+    If the cumulative body part content exceeds this value, an instance of
+    :class:`.MultipartParseError` is raised, and no further body parts are
+    yielded. Setting this option to ``0`` disables the limit and preserves the
+    default behavior.
+
+    .. versionadded:: 4.5
+    """
     max_body_part_headers_size: int
     """The maximum size (in bytes) of the body part headers structure
     (default ``8192``).
@@ -622,6 +691,7 @@ class MultipartParseOptions:
         'max_body_part_buffer_size',
         'max_body_part_count',
         'max_body_part_headers_size',
+        'max_body_part_total_size',
         'max_secure_filename_length',
         'media_handlers',
     )
@@ -631,6 +701,7 @@ class MultipartParseOptions:
         self.max_body_part_buffer_size = 1024 * 1024
         self.max_body_part_count = 64
         self.max_body_part_headers_size = 8192
+        self.max_body_part_total_size = 0
         self.max_secure_filename_length = None
         # NOTE(myusko,vytas): Here we create a copy of _DEFAULT_HANDLERS in
         #   order to prevent the modification of the class variable whenever

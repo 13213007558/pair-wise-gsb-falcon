@@ -193,6 +193,9 @@ class MultipartForm:
         #   (see the note below).
         self._dash_boundary = b'--' + boundary
         self._parse_options = parse_options
+        self._body_budget = multipart._BodySizeBudget(
+            parse_options.max_body_part_total_size
+        )
 
     def __aiter__(self) -> AsyncIterator[BodyPart]:
         return self._iterate_parts()
@@ -203,8 +206,18 @@ class MultipartForm:
         stream = self._stream
         max_headers_size = self._parse_options.max_body_part_headers_size
         remaining_parts = self._parse_options.max_body_part_count
+        previous_part: BodyPart | None = None
 
         while True:
+            # NOTE: Drain the body part yielded by the previous iteration (if
+            #   any) through its own delimited stream. This way content that
+            #   the caller never read is still charged against the form-wide
+            #   budget, while bytes already handed over are never counted a
+            #   second time.
+            if previous_part is not None:
+                await previous_part.stream.exhaust()
+                previous_part = None
+
             # NOTE(vytas): Either exhaust the unused stream part, or skip
             #   the prologue.
             try:
@@ -280,4 +293,10 @@ class MultipartForm:
                     description='maximum number of form body parts exceeded'
                 )
 
-            yield BodyPart(stream.delimit(delimiter), headers, self._parse_options)
+            part = BodyPart(
+                stream.delimit(delimiter, on_data=self._body_budget.charge),
+                headers,
+                self._parse_options,
+            )
+            previous_part = part
+            yield part

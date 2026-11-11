@@ -930,3 +930,391 @@ def test_multipart_parse_options_default_handlers_unique():
     assert parse_options_one.media_handlers is not parse_options_two.media_handlers
     assert len(parse_options_one.media_handlers) == 1
     assert len(parse_options_two.media_handlers) >= 2
+
+
+def test_parse_options_total_size_default_unlimited():
+    parse_options = MultipartParseOptions()
+    assert parse_options.max_body_part_total_size == 0
+
+
+def test_body_size_budget_limit_branches():
+    from falcon.media.multipart import _BodySizeBudget
+
+    unlimited = _BodySizeBudget(0)
+    unlimited.charge(10**9)
+    unlimited.charge(0)
+    assert unlimited._consumed == 10**9
+
+    budget = _BodySizeBudget(10)
+    budget.charge(0)
+    assert budget._consumed == 0
+    budget.charge(10)
+    assert budget._consumed == 10
+    with pytest.raises(falcon.MultipartParseError) as exc_info:
+        budget.charge(1)
+    assert exc_info.value.description == (
+        'total body part content size limit exceeded'
+    )
+
+
+TOTAL_SIZE_BOUNDARY = 'TOTAL-SIZE-BOUNDARY'
+TOTAL_SIZE_DELIMITER = b'\r\n--' + TOTAL_SIZE_BOUNDARY.encode()
+TOTAL_SIZE_PARTS = [
+    ('first', b'a' * 100),
+    ('second', b'b' * 50),
+    ('third', b'c' * 10),
+]
+TOTAL_SIZE_CONTENT = 160
+TOTAL_SIZE_JSON_PART = b'{"answer": 42}'
+
+
+def _build_total_size_form(parts=TOTAL_SIZE_PARTS, json_names=()):
+    json_names = set(json_names)
+    body = b''
+    for name, content in parts:
+        content_type = (
+            b'Content-Type: application/json\r\n' if name in json_names else b''
+        )
+        body += (
+            f'--{TOTAL_SIZE_BOUNDARY}\r\n'.encode()
+            + f'Content-Disposition: form-data; name="{name}"\r\n'.encode()
+            + content_type
+            + b'\r\n'
+            + content
+            + b'\r\n'
+        )
+    body += f'--{TOTAL_SIZE_BOUNDARY}--\r\n'.encode()
+    return body
+
+
+TOTAL_SIZE_CONTENT_TYPE = (
+    'multipart/form-data; boundary=' + TOTAL_SIZE_BOUNDARY
+)
+
+
+async def _fragmented(data, chunk_size):
+    for index in range(0, len(data), chunk_size):
+        yield data[index : index + chunk_size]
+
+
+def _make_total_size_handler(limit):
+    handler = media.MultipartFormHandler()
+    handler.parse_options.max_body_part_total_size = limit
+    return handler
+
+
+def _make_total_size_form(asgi, body, chunk_size, limit=0):
+    handler = _make_total_size_handler(limit)
+    if asgi:
+        from falcon.asgi.reader import BufferedReader as AsyncBufferedReader
+
+        stream = AsyncBufferedReader(_fragmented(body, chunk_size))
+        return falcon.async_to_sync(
+            handler.deserialize_async,
+            stream,
+            TOTAL_SIZE_CONTENT_TYPE,
+            len(body),
+        )
+
+    stream = BufferedReader(
+        io.BytesIO(body).read, len(body), chunk_size
+    )
+    return handler.deserialize(stream, TOTAL_SIZE_CONTENT_TYPE, len(body))
+
+
+async def _consume_part(asgi, part, strategy):
+    if strategy == 'stream-chunks':
+        if asgi:
+            chunks = [chunk async for chunk in part.stream]
+        else:
+            chunks = []
+            while True:
+                chunk = part.stream.read(7)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return b''.join(chunks)
+
+    if strategy == 'data':
+        return await part.data if asgi else part.data
+
+    if strategy == 'text':
+        return await part.text if asgi else part.text
+
+    if strategy == 'media':
+        return await part.get_media() if asgi else part.get_media()
+
+    raise AssertionError('unknown strategy: {}'.format(strategy))
+
+
+async def _iterate_total_size_form(asgi, form, read_strategies, skip=False):
+    parts = form.__aiter__() if asgi else iter(form)
+    collected = {}
+    index = 0
+
+    while True:
+        try:
+            part = await parts.__anext__() if asgi else next(parts)
+        except (StopAsyncIteration, StopIteration):
+            break
+
+        if skip and index == 1:
+            # NOTE: Move on to the next part without reading this one at all;
+            #   its content must still be charged against the total budget.
+            index += 1
+            continue
+
+        strategy = read_strategies[index % len(read_strategies)]
+        collected[part.name] = await _consume_part(asgi, part, strategy)
+        index += 1
+
+    return collected
+
+
+@pytest.mark.parametrize(
+    'chunk_size',
+    [
+        len(TOTAL_SIZE_DELIMITER),
+        len(TOTAL_SIZE_DELIMITER) + 1,
+        37,
+        64,
+    ],
+)
+@pytest.mark.parametrize(
+    'strategy',
+    ['stream-chunks', 'data', 'text'],
+)
+def test_total_body_part_size_enforced(asgi, chunk_size, strategy):
+    body = _build_total_size_form()
+    form = _make_total_size_form(asgi, body, chunk_size, TOTAL_SIZE_CONTENT - 1)
+
+    with pytest.raises(falcon.MultipartParseError) as exc_info:
+        falcon.async_to_sync(
+            _iterate_total_size_form, asgi, form, [strategy]
+        )
+
+    assert exc_info.value.description == (
+        'total body part content size limit exceeded'
+    )
+
+
+@pytest.mark.parametrize(
+    'chunk_size',
+    [
+        len(TOTAL_SIZE_DELIMITER),
+        len(TOTAL_SIZE_DELIMITER) + 1,
+        37,
+        64,
+    ],
+)
+def test_total_body_part_size_accepts_exact_limit(asgi, chunk_size):
+    body = _build_total_size_form()
+    form = _make_total_size_form(asgi, body, chunk_size, TOTAL_SIZE_CONTENT)
+
+    collected = falcon.async_to_sync(
+        _iterate_total_size_form, asgi, form, ['data']
+    )
+
+    assert collected == {
+        'first': b'a' * 100,
+        'second': b'b' * 50,
+        'third': b'c' * 10,
+    }
+
+
+@pytest.mark.parametrize(
+    'chunk_size',
+    [len(TOTAL_SIZE_DELIMITER), len(TOTAL_SIZE_DELIMITER) + 5, 64],
+)
+def test_total_body_part_size_shared_across_interfaces(asgi, chunk_size):
+    parts = [
+        ('first', b'a' * 100),
+        ('second', TOTAL_SIZE_JSON_PART),
+        ('third', b'c' * 10),
+    ]
+    content_size = sum(len(content) for _, content in parts)
+    body = _build_total_size_form(parts, json_names=('second',))
+    form = _make_total_size_form(asgi, body, chunk_size, content_size)
+
+    collected = falcon.async_to_sync(
+        _iterate_total_size_form,
+        asgi,
+        form,
+        ['stream-chunks', 'media', 'text'],
+    )
+
+    assert collected == {
+        'first': b'a' * 100,
+        'second': {'answer': 42},
+        'third': 'cccccccccc',
+    }
+
+
+@pytest.mark.parametrize(
+    'chunk_size',
+    [len(TOTAL_SIZE_DELIMITER), len(TOTAL_SIZE_DELIMITER) + 7, 64],
+)
+def test_total_body_part_size_enforced_via_media(asgi, chunk_size):
+    json_parts = [
+        ('one', b'{"v": 1, "padding": "aaaaaaaaaaaaaaaaaaaa"}'),
+        ('two', b'{"v": 2, "padding": "bbbbbbbbbbbbbbbbbbbb"}'),
+        ('three', b'{"v": 3, "padding": "cccccccccccccccccccc"}'),
+    ]
+    body = _build_total_size_form(
+        json_parts, json_names=('one', 'two', 'three')
+    )
+    limit = sum(len(content) for _, content in json_parts) - 1
+    form = _make_total_size_form(asgi, body, chunk_size, limit)
+
+    with pytest.raises(falcon.MultipartParseError) as exc_info:
+        falcon.async_to_sync(
+            _iterate_total_size_form, asgi, form, ['media']
+        )
+
+    assert exc_info.value.description == (
+        'total body part content size limit exceeded'
+    )
+
+
+@pytest.mark.parametrize(
+    'chunk_size',
+    [len(TOTAL_SIZE_DELIMITER), len(TOTAL_SIZE_DELIMITER) + 3, 64],
+)
+def test_total_body_part_size_skipping_large_part(asgi, chunk_size):
+    skipped_size = 500
+    body = _build_total_size_form(
+        [
+            ('small', b'q'),
+            ('big', b'B' * skipped_size),
+            ('after', b'z'),
+        ]
+    )
+    form = _make_total_size_form(
+        asgi, body, chunk_size, skipped_size
+    )
+
+    with pytest.raises(falcon.MultipartParseError) as exc_info:
+        falcon.async_to_sync(
+            _iterate_total_size_form,
+            asgi,
+            form,
+            ['stream-chunks'],
+            skip=True,
+        )
+
+    assert exc_info.value.description == (
+        'total body part content size limit exceeded'
+    )
+
+
+def test_total_body_part_size_skip_under_limit_continues(asgi):
+    body = _build_total_size_form(
+        [
+            ('small', b'q'),
+            ('big', b'B' * 100),
+            ('after', b'z'),
+        ]
+    )
+    form = _make_total_size_form(asgi, body, 64, 102)
+
+    collected = falcon.async_to_sync(
+        _iterate_total_size_form,
+        asgi,
+        form,
+        ['stream-chunks'],
+        skip=True,
+    )
+
+    assert collected == {'small': b'q', 'after': b'z'}
+
+
+def test_total_body_part_size_counts_headers_neither_twice(asgi):
+    body = _build_total_size_form()
+    form = _make_total_size_form(asgi, body, 64, TOTAL_SIZE_CONTENT)
+
+    falcon.async_to_sync(_assert_headers_and_caching_not_double_counted, asgi, form)
+
+
+async def _assert_headers_and_caching_not_double_counted(asgi, form):
+    parts = form.__aiter__() if asgi else iter(form)
+    while True:
+        try:
+            part = await parts.__anext__() if asgi else next(parts)
+        except (StopAsyncIteration, StopIteration):
+            break
+
+        # NOTE: The part headers add well over a dozen bytes each; if they
+        #   were counted, the exact-content limit would be exceeded. Re-reading
+        #   cached data/text must not charge the budget a second time either.
+        if asgi:
+            assert await part.data
+            assert await part.data
+            assert await part.text
+        else:
+            assert part.data
+            assert part.data
+            assert part.text
+
+
+class _TotalSizeResource:
+    def on_post(self, req, resp):
+        names = []
+        for part in req.media:
+            names.append(part.name)
+            part.stream.exhaust()
+
+        resp.media = {'names': names}
+
+    async def on_post_async(self, req, resp):
+        names = []
+        async for part in await req.media:
+            names.append(part.name)
+            await part.stream.exhaust()
+
+        resp.media = {'names': names}
+
+
+@pytest.mark.parametrize('limit', [0, 10 * 1024 * 1024])
+def test_total_body_part_size_end_to_end(asgi, util, limit):
+    handler = _make_total_size_handler(limit)
+    app = util.create_app(asgi)
+    app.req_options.media_handlers = media.Handlers(
+        {falcon.MEDIA_MULTIPART: handler}
+    )
+    resource = _TotalSizeResource()
+    app.add_route('/submit', resource, suffix='async' if asgi else '')
+    client = testing.TestClient(app)
+
+    body = _build_total_size_form()
+    resp = client.simulate_post(
+        '/submit',
+        headers={'Content-Type': TOTAL_SIZE_CONTENT_TYPE},
+        body=body,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json == {'names': ['first', 'second', 'third']}
+
+
+def test_total_body_part_size_end_to_end_rejected(asgi, util):
+    handler = _make_total_size_handler(TOTAL_SIZE_CONTENT - 1)
+    app = util.create_app(asgi)
+    app.req_options.media_handlers = media.Handlers(
+        {falcon.MEDIA_MULTIPART: handler}
+    )
+    resource = _TotalSizeResource()
+    app.add_route('/submit', resource, suffix='async' if asgi else '')
+    client = testing.TestClient(app)
+
+    body = _build_total_size_form()
+    resp = client.simulate_post(
+        '/submit',
+        headers={'Content-Type': TOTAL_SIZE_CONTENT_TYPE},
+        body=body,
+    )
+
+    assert resp.status_code == 400
+    assert resp.json == {
+        'description': 'total body part content size limit exceeded',
+        'title': 'Malformed multipart/form-data request media',
+    }

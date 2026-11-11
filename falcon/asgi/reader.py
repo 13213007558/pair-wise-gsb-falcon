@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from collections.abc import Callable
 import io
 from typing import NoReturn, Protocol
 
@@ -28,6 +29,14 @@ DEFAULT_CHUNK_SIZE = 8192
 """Default minimum chunk size for :class:`BufferedReader` (8 KiB)."""
 
 _MAX_JOIN_CHUNKS = 1024
+
+
+async def _iter_with_data_callback(
+    source: AsyncIterator[bytes], on_data: Callable[[int], None]
+) -> AsyncIterator[bytes]:
+    async for chunk in source:
+        on_data(len(chunk))
+        yield chunk
 
 
 class BufferedReader:
@@ -245,8 +254,15 @@ class BufferedReader:
 
         return result_bytes.getvalue()
 
-    def delimit(self, delimiter: bytes) -> BufferedReader:  # TODO: should se self
-        return type(self)(self._iter_delimited(delimiter), chunk_size=self._chunk_size)
+    def delimit(
+        self,
+        delimiter: bytes,
+        on_data: Callable[[int], None] | None = None,
+    ) -> BufferedReader:  # TODO: should se self
+        iterator = self._iter_delimited(delimiter)
+        if on_data is not None:
+            iterator = _iter_with_data_callback(iterator, on_data)
+        return type(self)(iterator, chunk_size=self._chunk_size)
 
     # -------------------------------------------------------------------------
     # Asynchronous IO interface.

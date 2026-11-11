@@ -28,6 +28,17 @@ DEFAULT_CHUNK_SIZE = 32768
 _MAX_JOIN_CHUNKS = 128
 
 
+def _wrap_with_data_callback(
+    read: Callable[[int], bytes], on_data: Callable[[int], None]
+) -> Callable[[int], bytes]:
+    def read_and_account(size: int) -> bytes:
+        chunk = read(size)
+        on_data(len(chunk))
+        return chunk
+
+    return read_and_account
+
+
 class BufferedReader:
     def __init__(
         self,
@@ -373,8 +384,14 @@ class BufferedReader:
     def exhaust(self) -> None:
         self.pipe()
 
-    def delimit(self, delimiter: bytes) -> BufferedReader:
+    def delimit(
+        self,
+        delimiter: bytes,
+        on_data: Callable[[int], None] | None = None,
+    ) -> BufferedReader:
         read = functools.partial(self.read_until, delimiter)
+        if on_data is not None:
+            read = _wrap_with_data_callback(read, on_data)
         return type(self)(read, self._normalize_size(None), self._chunk_size)
 
     def readline(self, size: int = -1) -> bytes:
