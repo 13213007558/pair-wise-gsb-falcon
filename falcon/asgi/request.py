@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable
 from collections.abc import Mapping
 from typing import (
@@ -78,6 +79,7 @@ class Request(request.Request):
         # '_asgi_server_cached',
         # '_cached_headers',
         '_first_event',
+        '_media_task',
         '_receive',
         # '_stream',
         'scope',
@@ -98,6 +100,7 @@ class Request(request.Request):
     _cached_uri: str | None = None
     _media: UnsetOr[Any] = _UNSET
     _media_error: Exception | None = None
+    _media_task: asyncio.Task[Any] | None
     _stream: BoundedStream | None = None
 
     scope: AsgiRequestScope
@@ -167,6 +170,7 @@ class Request(request.Request):
         # PERF(vytas): Fall back to class variable(s) when unset.
         # self._media = _UNSET
         # self._media_error = None
+        self._media_task = None
 
         # TODO(kgriffs): ASGI does not specify whether 'path' may be empty,
         #   as was allowed for WSGI.
@@ -588,6 +592,13 @@ class Request(request.Request):
         deserialize the request body, the exception will propagate up
         to the caller.
 
+        Concurrent calls on the same request share a single deserialization
+        pass. They observe the same cached object, or the same raised error,
+        even if several callers await :meth:`~.get_media` while the body is
+        still being read. Cancelling one waiting caller does not interrupt the
+        in-flight deserialization, so the other callers still receive the
+        complete body rather than an empty or partially read one.
+
         See also :ref:`media` for more information regarding media handling.
 
         Note:
@@ -625,6 +636,31 @@ class Request(request.Request):
                 return default_when_empty
             raise self._media_error
 
+        if self._media_task is None:
+            task = asyncio.create_task(self._resolve_media())
+            self._media_task = task
+            # NOTE: Drain the task outcome when nobody awaits it so that a
+            #   parsing failure does not surface as an "unretrieved exception"
+            #   warning. Whole-request teardown is handled by the ASGI App via
+            #   aclose_media_task().
+            task.add_done_callback(_discard_media_task_result)
+        else:
+            task = self._media_task
+
+        # NOTE: Shield the shared task so that cancelling this caller leaves
+        #   the single deserialization pass running for the other waiters. A
+        #   task that already finished is handled by the cache checks above; a
+        #   cancelled task simply re-raises CancelledError here.
+        try:
+            return await asyncio.shield(task)
+        except errors.MediaNotFoundError:
+            # NOTE: A failure to parse an empty body is cached and shared, but
+            #   default_when_empty stays specific to this individual call.
+            if default_when_empty is not _UNSET:
+                return default_when_empty
+            raise
+
+    async def _resolve_media(self) -> Any:
         handler, _, deserialize_sync = self.options.media_handlers._resolve(
             self.content_type, self.options.default_media_type
         )
@@ -636,20 +672,41 @@ class Request(request.Request):
                 self._media = await handler.deserialize_async(
                     self.stream, self.content_type, self.content_length
                 )
-
-        except errors.MediaNotFoundError as err:
-            self._media_error = err
-            if default_when_empty is not _UNSET:
-                return default_when_empty
-            raise
-        except Exception as err:
-            self._media_error = err
+        except Exception as ex:
+            self._media_error = ex
             raise
         finally:
             if handler.exhaust_stream:
                 await self.stream.exhaust()
 
         return self._media
+
+    async def aclose_media_task(self) -> None:
+        """Cancel and drain an in-flight shared media parsing task.
+
+        This is invoked by the ASGI :class:`~falcon.asgi.App` when the whole
+        request is being torn down (for instance because the ASGI server
+        cancels the request). Once no request-level coroutine remains to await
+        the shared :meth:`~.get_media` task, it is cancelled so that a parse
+        coroutine blocked while reading the body does not leak a task. The
+        resulting :class:`asyncio.CancelledError` is awaited here, and any
+        other outcome is drained by :func:`_discard_media_task_result`.
+        """
+        task = self._media_task
+        if task is None or task.done():
+            return
+
+        task.cancel()
+        # NOTE: Shield the drain so that an outer request cancellation cannot
+        #   interrupt us before the parsing task has observed its own
+        #   CancelledError and settled. A CancelledError simply means the
+        #   await was interrupted; the loop re-checks the inner task and keeps
+        #   waiting until it is done.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
 
     media: Awaitable[Any] = cast(Awaitable[Any], property(get_media))
     """An awaitable property that acts as an alias for
@@ -954,3 +1011,15 @@ class Request(request.Request):
     @property
     def _secure_scheme(self) -> bool:
         return self.scheme == 'https' or self.scheme == 'wss'
+
+
+def _discard_media_task_result(task: asyncio.Task[Any]) -> None:
+    # NOTE: Retrieve the task outcome so that a parsing failure does not get
+    #   reported as an unretrieved task exception when all callers were
+    #   cancelled before awaiting the result.
+    if not task.cancelled():
+        try:
+            task.exception()
+        except asyncio.InvalidStateError:
+            # NOTE: The task completed successfully and has no exception.
+            pass

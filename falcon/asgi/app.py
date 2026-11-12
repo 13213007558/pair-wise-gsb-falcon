@@ -455,11 +455,32 @@ class App(falcon.app.App[_ReqT, _RespT]):
         )
 
     @_wrap_asgi_coroutine_func
-    async def __call__(  # type: ignore[override] # noqa: C901
+    async def __call__(  # type: ignore[override]
         self,
         scope: AsgiRequestScope,
         receive: AsgiReceive,
         send: AsgiSend,
+    ) -> None:
+        # NOTE: Populated as soon as the Request object is created, so that it
+        #   remains reachable in the finally-block even when request
+        #   processing is cancelled before it can return.
+        request_holder: dict[str, Request] = {}
+        try:
+            await self._handle_http_request(scope, receive, send, request_holder)
+        finally:
+            # NOTE: If the request as a whole is cancelled (for example by the
+            #   ASGI server), make sure a shared get_media() parsing task does
+            #   not leak a task that may still be blocked reading the body.
+            req = request_holder.get('req')
+            if req is not None:
+                await req.aclose_media_task()
+
+    async def _handle_http_request(  # noqa: C901
+        self,
+        scope: AsgiRequestScope,
+        receive: AsgiReceive,
+        send: AsgiSend,
+        request_holder: dict[str, Request],
     ) -> None:
         # NOTE(kgriffs): The ASGI spec requires the 'type' key to be present.
         scope_type: str = scope['type']
@@ -517,6 +538,7 @@ class App(falcon.app.App[_ReqT, _RespT]):
         req = self._request_type(
             scope, receive, first_event=first_event, options=self.req_options
         )
+        request_holder['req'] = req
         resp = self._response_type(options=self.resp_options)
 
         resource: Resource | None = None

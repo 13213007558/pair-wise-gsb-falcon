@@ -156,6 +156,21 @@ is passed to the ``default_when_empty`` attribute of the current invocation.
 
 External handlers should update their logic to align to the internal Falcon handlers.
 
+.. note::
+
+    Under ASGI, several coroutines may await
+    :meth:`~falcon.asgi.Request.get_media` on the same request at the same
+    time, for example when an authorization check and an audit hook both read
+    the body concurrently. Such calls share a single deserialization pass: the
+    body is read and parsed only once, and every caller observes the same
+    cached object, or the same raised error. Cancelling one waiting caller does
+    not interrupt the in-flight deserialization, so the other callers still
+    receive the complete body rather than an empty or partially read one. The
+    ``default_when_empty`` argument is not cached and continues to apply to each
+    individual call. If the whole request is cancelled while a parse is still in
+    progress, the ASGI app cancels and drains the shared parsing task during
+    request teardown so that it does not leak.
+
 .. _custom_media_handlers:
 
 Replacing the Default Handlers
